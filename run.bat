@@ -39,7 +39,7 @@ goto end
 :train
 cls
 echo Starting AI Training with Your Recorded Gameplay...
-"C:\Users\jfait\AppData\Local\Programs\Python\Python312\python.exe" train_with_cloning.py
+"\Python\Python312\python.exe" train_with_cloning.py
 goto end
 
 :record
@@ -47,7 +47,7 @@ cls
 echo Starting a New Gameplay Recording Session...
 echo (Basic version - captures actions only)
 echo.
-"C:\Users\jfait\AppData\Local\Programs\Python\Python312\python.exe" imitation_simple.py
+"\Python\Python312\python.exe" imitation_simple.py
 goto end
 
 :record_camera
@@ -55,21 +55,21 @@ cls
 echo Starting ENHANCED Recording with Camera Tracking...
 echo (Recommended! Captures actions + camera movements)
 echo.
-"C:\Users\jfait\AppData\Local\Programs\Python\Python312\python.exe" imitation_with_camera.py
+"\Python\Python312\python.exe" imitation_with_camera.py
 goto end
 
 :clone
 cls
 echo Training AI from Scratch (without recorded data)...
 echo.
-"C:\Users\jfait\AppData\Local\Programs\Python\Python312\python.exe" main.py
+"\Python\Python312\python.exe" main.py
 goto end
 
 :analyze
 cls
 echo Opening AI Learning Analyzer...
 echo.
-"C:\Users\jfait\AppData\Local\Programs\Python\Python312\python.exe" analyze.py
+"\Python\Python312\python.exe" analyze.py
 goto end
 
 :custom
@@ -77,7 +77,7 @@ cls
 echo.
 set /p script="Enter the Python script to run: "
 if "%script%"=="" goto end
-"C:\Users\jfait\AppData\Local\Programs\Python\Python312\python.exe" %script%
+"\Python\Python312\python.exe" %script%
 goto end
 
 :end
@@ -85,3 +85,4 @@ REM Keep window open so you can see output and any errors
 echo.
 echo Press any key to close this window...
 pause >nul
+

@@ -178,7 +178,7 @@ def main():
         import subprocess
         import os
         script_path = os.path.join(os.path.dirname(__file__), 'configure_goals.py')
-        subprocess.Popen([r"C:\Users\jfait\AppData\Local\Programs\Python\Python312\python.exe", script_path])
+        subprocess.Popen([r"\Python\Python312\python.exe", script_path])
     
     elif choice == '7':
         try:
@@ -203,3 +203,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

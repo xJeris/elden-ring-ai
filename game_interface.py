@@ -446,8 +446,8 @@ class GameInterface:
             
             if prompt_region.size == 0:
                 return {
-                    'has_closable_door': False, 
-                    'has_open_prompt': False,
+                    'has_closable_door': False,     # True if ANY interaction prompt visible
+                    'has_open_prompt': False,       # True if ANY interaction prompt visible (generic, not door-specific)
                     'prompt_is_white': False,
                     'prompt_brightness': 'none'
                 }
@@ -483,15 +483,15 @@ class GameInterface:
                 brightness = 'none'
             
             return {
-                'has_closable_door': has_any,
-                'has_open_prompt': has_any,
+                'has_closable_door': has_any,      # True if ANY interaction prompt visible
+                'has_open_prompt': has_any,        # True if ANY interaction prompt visible (generic, not door-specific)
                 'prompt_is_white': has_white,
                 'prompt_brightness': brightness
             }
         except Exception as e:
             return {
-                'has_closable_door': False, 
-                'has_open_prompt': False,
+                'has_closable_door': False,     # True if ANY interaction prompt visible
+                'has_open_prompt': False,       # True if ANY interaction prompt visible (generic, not door-specific)
                 'prompt_is_white': False,
                 'prompt_brightness': 'none'
             }

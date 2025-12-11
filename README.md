@@ -48,21 +48,37 @@ The agent perceives game state through computer vision-based detection:
 
 ## Reward Structure
 
+### Interaction System (State-Change Gated)
+The new interact system uses **state-change detection** to determine whether an interaction was successful:
+
+1. **Player presses E** on a valid prompt → defer reward calculation
+2. **Next frame check**:
+   - **Prompt disappeared** → STATE CHANGED → +20.0 (successful interaction)
+   - **Inventory changed** → STATE CHANGED → +20.0 (obtained item, can retry locked doors)
+   - **Neither changed, first attempt** → NO STATE CHANGE → +0.0 (neutral test)
+   - **Neither changed, retry** → NO STATE CHANGE → -0.5 (penalty for re-spamming)
+
+This design:
+- Rewards successful door openings and item pickups (+20.0)
+- Allows one free test attempt on locked doors without penalty
+- Penalizes repeated failures on locked doors (-0.5)
+- Resets the free attempt when inventory changes (AI can try again after getting the item)
+
 ### Movement (Exploration Primary)
 - **Forward Movement**: +1.0 (strong incentive for exploration)
 - **Momentum Bonus**: +0.25 for continuing forward
 - **Backward Movement**: -0.5 (opposite of goal)
 - **Sideways Movement**: -0.10 (not primary direction)
 
-### Door Interaction (Critical)
-- **Door with White Prompt + Interact**: +5.0 (highest reward)
-- **Ignoring Ready Door**: -10.0 (catastrophic penalty)
-- **Door with Grey Prompt**: +1.0 for waiting
-- **Door with Wizened Finger**: +1.0 when pressing E
+### Door Interaction (Critical - State-Change Gated)
+- **Interact with Valid Prompt (State Change)**: +20.0 (prompt disappears, door opens, item picked up, etc.)
+- **Interact Attempt (No State Change, First Try)**: +0.0 (neutral - test if door is locked without penalty)
+- **Interact Attempt (No State Change, Retry)**: -0.5 (penalty for re-spamming locked door)
+- **Interact After Inventory Change**: +20.0 (obtained item, can now open locked door)
+- **Dwell Time Penalty**: -0.5 per step after 2+ consecutive steps of visible prompt without pressing E (exploration only)
 
 ### Item Interaction
-- **Interact with Visible Items**: +0.7 (strong incentive to loot)
-- **General Interact**: +0.5 (NPCs, other interactions)
+- **Interact with Ground Items**: +0.7 (bonus for looting)
 
 ### Map (Heavily Suppressed)
 - **Opening Map**: -15.0 (severe penalty, returns early to suppress other rewards)
@@ -70,11 +86,17 @@ The agent perceives game state through computer vision-based detection:
 - **Closing Map Quickly**: +0.1 (minimal recovery, net still -14.9)
 
 ### Combat Actions
+- **Attack Actions (Normal/Heavy)**: -0.2 (combat avoided during exploration)
 - **Backstep/Dodge**: -1.0 (never dodge during exploration)
 - **Jump**: -1.0 (never jump during exploration)
-- **Using Items**: -0.5 (no item use during exploration)
+- **Using Items**: -10.0 (strict constraint in exploration)
 - **Lock-on**: -0.2 (combat prep, avoided)
-- **Summon Mount**: -0.1 (unavailable, penalties avoided action)
+- **Skill**: -0.3 (skill use avoided)
+- **Summon Mount**: -0.1 (unavailable, minimal penalty)
+
+### Wasted Interact Penalties
+- **Spam within 5 steps of last attempt**: -1.0 (rapid re-attempt penalty)
+- **Attempt after 5+ steps**: -0.5 (lighter penalty for spaced attempts)
 
 ### Camera & Navigation
 - **Camera Panning**: -0.15 (small penalty, not neutral)
@@ -189,43 +211,58 @@ python analyze_training.py
 - ✅ Behavioral cloning infrastructure available
 
 ### Known Limitations
-- Status buildup detection needs calibration once agent encounters poison/rot/bleed
+- State-change detection based on prompt disappearance and inventory changes (doesn't detect all in-game state changes like dialogue advancement)
 - Ground item detection uses brightness threshold (may need tuning for different lighting)
 - No direct enemy health bar detection (only boss bars)
 - Camera control is mouse-based (may be noisy in some situations)
+- Floor messages and item prompts may stack on-screen (edge case not fully handled)
+
+### Recent Changes (Latest Session)
+- ✅ Implemented state-change gated interact rewards (replaces time-based logic)
+- ✅ Added inventory tracking for retry validation
+- ✅ Implemented dwell time penalty (-0.5/step after 2+ steps without pressing E)
+- ✅ Added interact diagnostics tracking (successful, wasted, missed opportunities)
+- ✅ Removed void detection system (unreliable, replaced with learned behavior from health damage)
+- ✅ Fixed missed opportunities counter to count prompt appearances, not persistence steps
+- ✅ One free attempt to validate locked doors, penalty only on retry (-0.5)
 
 ## Performance Metrics
 
-### Action Distribution (Recent Session)
-- Movement (forward/left/right): ~6-7% each (good exploration)
-- Interact: ~5-6% (appropriate door/item focus)
-- Map: ~5% (still high, working on further suppression)
-- Camera adjustments: ~4-6% (controlled with penalties)
-- Combat actions: <5% (correctly avoided during exploration)
+### Action Distribution (Most Recent Training Session - 26,374 steps)
+- **Interact**: 7.46% (1,967 attempts, 100% successful on valid targets)
+- **Jump**: 7.21% 
+- **Move Left**: 11.93%
+- **Move Right**: 7.15%
+- **Move Forward**: 7.19%
+- **Open Map**: 5.64%
+- **Camera Actions**: ~13% combined
+- **Combat Actions**: <5% (correctly avoided)
 
-### Training Efficiency
-- Training pause: ~2-3 seconds between rollouts (reduced from 5-6s)
-- Frame processing: Real-time capture and grayscale conversion
-- Observation validation: Active assertions on every step
+### Interact Breakdown
+- **Successful (valid target)**: 1,967 / 1,967 (100%)
+- **Wasted (no target)**: 0 (filtered by state-change gating)
+- **Missed opportunities**: Varies by episode (prompts seen but E not pressed)
+
+### Training Characteristics
+- **Learned behavior**: AI no longer avoids doors; presses E on valid prompts
+- **Spam control**: State-change detection prevents infinite message reading
+- **Test-and-retry**: Free attempt on locked doors encourages persistence with inventory changes
 
 ## Tuning Parameters
 
+### Interact Reward System
+To adjust interact behavior, modify values in `ai_agent.py` `step()` → `_calculate_reward()`:
+- **Successful interaction (+20.0)**: Base reward for state-change detection success
+- **Failed attempt, first try (+0.0)**: Free test on locked doors
+- **Failed attempt, retry (-0.5)**: Penalty for re-spamming same prompt
+- **Dwell penalty (-0.5/step)**: Applied after 2+ steps of visible prompt without E press
+- **Inventory change reset**: Clears failed attempt tracking, allows fresh try
+
 ### Reward Scaling
-To adjust AI behavior, modify reward values in `ai_agent.py` `_calculate_reward()`:
+To adjust overall AI behavior, modify reward values:
 - Increase forward movement reward to encourage more exploration
-- Adjust door/item bonuses to shift focus priorities
-- Modify penalty values (map, dodging, etc.) to change constraint strength
-
-### Observation Processing
-In `ai_agent.py` `FrameStackWrapper`:
-- `frame_size = 84` - Resize target (lower = faster, higher = more detail)
-- `num_stack = 4` - Temporal context window (higher = more motion info)
-
-### Training Configuration
-In `ai_agent.py` `AIAgent.__init__()`:
-- `n_steps` - Trajectory collection length (higher = fewer pauses, more off-policy)
-- `n_epochs` - Gradient updates per rollout (higher = more training per pause)
-- `learning_rate` - Policy update speed (higher = faster learning, less stable)
+- Adjust interact bonuses to shift focus priorities
+- Modify penalty values (map, combat, etc.) to change constraint strength
 
 ## Future Improvements
 

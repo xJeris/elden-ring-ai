@@ -86,13 +86,21 @@ Computes mean absolute difference between 8×8 downsampled grayscale frames.
   - Indicates forward movement, camera pan, environmental exploration
 - **Sustained low visual change** (diff < 2 for 3+ frames): -0.05 penalty
   - Indicates strafing, standing still, wiggling in place
-  
+
+**Curiosity Suppression (Map UI Prevention):**
+- Visual curiosity rewards are suppressed when:
+  - Map is being toggled (action 18)
+  - Map UI is open (`self.map_open`)
+  - Map subwindows are open (`self.map_subwindow_open` - inventory, markers, etc.)
+- Prevents AI from exploiting large visual changes caused by map UI transitions
+- Suppression only affects curiosity reward calculations, not stagnation detection
+
 **Why this matters:**
 - Can't cheat by walking backward at wall (high-level state unchanged, but low visual change)
 - Can't strafe left-right repeatedly without moving forward (pixels change minimally)
+- Can't farm curiosity rewards from map UI screen transitions
 - Rewards actual exploration over micro-farming
 
-**Purpose:** Prevents low-level farming behaviors that don't change game state
 
 ### Interaction System (State-Change Gated + Novelty Bonus)
 The interact system uses **state-change detection** plus **novelty tracking** to determine whether an interaction was successful:
@@ -132,6 +140,9 @@ Prevents AI from switching directions rapidly to farm micro-rewards without real
   - Penalty: -0.2 if attempted to flip before cooldown expires
   - Prevents: Left-right oscillation [3,4,3,4] pattern detection
 - **Lateral Oscillation Detection**: -0.2 penalty for alternating left-right rapidly
+- **Lateral Movement Suppression**: -0.05 additional penalty when left/right actions sustained with low visual change (3+ frames)
+  - Specifically targets strafing in place without forward progress
+  - Independent check: applies in addition to other movement penalties
 - **Momentum Reset**: `consecutive_frames_in_direction = 0` when interact (action 12) taken
 
 **Purpose:** Forces coherent exploration paths instead of dithering at decision points
@@ -154,6 +165,7 @@ Prevents AI from switching directions rapidly to farm micro-rewards without real
 - **Any Action While Map Open**: -0.5/step (continuous penalty encourages closing)
 - **Map Reopen Cooldown**: 900 steps (30 seconds) after closing to prevent oscillation
 - **Subwindow Validation**: State resync ensures penalties only apply when map actually open
+- **Visual Curiosity Suppression**: Curiosity rewards suppressed when map/subwindow open, preventing AI from farming visual novelty rewards from UI transitions
 
 ### Combat Actions (Prime Directives)
 - **Attack Actions (Normal/Heavy)**: -0.2 (combat avoided during exploration)
@@ -284,10 +296,10 @@ python analyze_training.py
 - ✅ **Momentum enforcement to prevent dithering** (direction change penalties + cooldown)
 - ✅ **Direction continuity bonus** (+0.3 per 10 frames in same direction)
 - ✅ **Lateral oscillation detection** (-0.2 for [3,4,3,4] patterns)
+- ✅ **Lateral movement suppression** (-0.05 for sustained left/right with low visual change)
 - ✅ **State-signature curiosity** (10-attribute state, +0.4 on change, -0.1 escalating penalty)
 - ✅ **Visual pixel-level curiosity** (8×8 frame diff, +0.1 for large changes, -0.05 for stagnation)
 - ✅ All recent code fixes verified and syntax clean
-- ✅ Comprehensive error handling with debug logging (9 try-catch blocks)
 - ✅ All core files compile with Python 3.12
 - ✅ Behavioral cloning infrastructure available
 - ✅ All resets implemented across episode start, area transitions, and state changes
@@ -329,7 +341,7 @@ python analyze_training.py
 - ✅ **Cooldown decrement fix**: Now decrements EVERY movement step (was only during forward)
 - ✅ **Consecutive frames reset**: Fixed missing reset in `reset()` method at episode start
 
-**Phase 4: Curiosity-Driven Exploration System (CURRENT)**
+**Phase 4: Curiosity-Driven Exploration System**
 - ✅ **Extended state signature**: 3 attributes → 10 attributes (exits, doors, health, stamina, prompts, items, location, combat)
 - ✅ **State-signature curiosity**: +0.4 reward on state change (was +0.2), -0.1 escalating penalty for stagnation
 - ✅ **Stagnation detection threshold**: 3 frames (was 5) – more aggressive exploration
@@ -341,6 +353,12 @@ python analyze_training.py
 - ✅ **Dual-layer curiosity**: High-level state changes + low-level pixel changes
 - ✅ **All resets implemented**: Episode start, area transitions, state changes
 
+**Phase 5: Enhanced Anti-Farming Movement System (CURRENT)**
+- ✅ **Lateral movement suppression** (NEW): -0.05 penalty for left/right actions sustained 3+ frames with low visual change
+- ✅ **Independent gating**: Lateral penalty applies independently of other movement penalties
+- ✅ **Stuck detection bypass**: Lateral penalty suppressed when stuck_counter > 0 (allows escaping)
+- ✅ **All code cleaned**: Removed debug infrastructure, production-ready
+
 **Current Tuning Parameters:**
 - State-signature exploration reward: +0.4
 - State-signature stagnation penalty: -0.1 (escalating), capped at -0.5
@@ -349,6 +367,8 @@ python analyze_training.py
 - Visual stagnation penalty: -0.05
 - Visual diff threshold: > 5 (reward), < 2 (penalty)
 - Visual penalty trigger: 3+ consecutive low-diff frames
+- Lateral movement suppression: -0.05 (independent of other penalties)
+- Lateral trigger: left/right actions + 3+ consecutive low-diff frames
 
 **Expected Results After All Changes:**
 - Interact: ~10% (down from 25.53%)
@@ -419,13 +439,14 @@ To adjust exploration behavior, modify values in [ai_agent.py](ai_agent.py) step
 - Combined: Catches both high-level and low-level farming behaviors
 
 ### Direction Control System
-To adjust direction stability, modify values in [ai_agent.py](ai_agent.py) step() method (lines 1264-1340):
+To adjust direction stability, modify values in [ai_agent.py](ai_agent.py) step() method (lines 600-650):
 - **Direction change penalty (-0.4)**: Applied when changing direction before 5-frame threshold
 - **Direction continuity bonus (+0.3)**: Applied every 10 consecutive frames in same direction
 - **Direction flip cooldown (5 steps)**: Minimum frames before same direction can be retried
 - **Cooldown penalty (-0.2)**: Applied if flip attempted during active cooldown
 - **Oscillation threshold**: Detects [3,4,3,4] or [4,3,4,3] patterns (left-right alternation)
 - **Oscillation penalty (-0.2)**: Applied on detection
+- **Lateral movement suppression (-0.05)**: Applied when left/right sustained 3+ frames with low visual change
 - **Momentum reset**: Resets `consecutive_frames_in_direction = 0` when interact action (12) taken
 
 ### Interact Reward System
@@ -463,23 +484,6 @@ To adjust overall AI behavior, modify reward values:
 - **Novelty Check** (line 599-600): `if hash not in self.prompt_hash_stats` triggers +2.0 bonus
 - **Repetition Check** (line 1387-1391): `if hash in stats AND successes==0` triggers -1.0 penalty
 - **Purpose**: Monitor unique prompts, success rates, and guide exploration behavior across episodes
-
-## Debugging & Error Handling
-
-### Debug Logging
-Comprehensive try-catch blocks at critical state access points (marked with 🔴 DEBUG):
-- Line 460: observation extraction
-- Line 470: stuck detection state access
-- Line 549: main state extraction
-- Line 564: wizened finger detection
-- Line 587: interact state change detection
-- Line 680: player position access
-- Line 803: map UI visible validation
-- Line 821: hash attempt tracking
-- Line 830: inventory count access
-- Line 906: boss health/fog wall access
-
-Each prints line number before raising exception for rapid error diagnosis.
 
 ## Future Improvements
 

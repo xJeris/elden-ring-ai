@@ -324,6 +324,9 @@ class EldenRingEnv(gym.Env):
         # Track stuck detection - when AI repeats same movement without progress
         self.last_state_signature = None  # Previous state signature for comparison
         self.stuck_consecutive_frames = 0  # Count of consecutive frames in same state
+        self.consecutive_unchanged_frames = 0  # Count of consecutive frames with unchanged state signature (for curiosity reward)
+        self.last_tiny_frame = None  # Last 8x8 downsampled frame for visual curiosity signal
+        self.consecutive_low_visual_diff_frames = 0  # Count of frames with low pixel-level changes (stagnation)
         self.stuck_counter = 0  # How many steps in current stuck area
         self.last_direction_tried = None  # Track which direction to try next when stuck
         self.stuck_directions = {}  # Track which directions have walls (e.g., {'forward': 45, 'left': 23})
@@ -364,6 +367,9 @@ class EldenRingEnv(gym.Env):
         # Track movement trajectory - reward continuing in same direction (momentum)
         self.last_movement_action = None  # Last movement action taken (1=forward, 2=back, 3=left, 4=right)
         self.direction_change_penalty_multiplier = 1.0  # Increases penalty for changing direction
+        self.direction_flip_cooldown = 0  # Frames remaining in flip cooldown (prevents rapid direction reversals)
+        self.last_direction_before_flip = None  # Track direction before flip to detect reversals
+        self.recent_movement_actions = []  # History of last 5 movement actions for oscillation detection
         
         # Track combat state persistently (not just locally in step)
         self.in_combat = False  # Are we currently in combat?
@@ -479,11 +485,19 @@ class EldenRingEnv(gym.Env):
             print(f"🔴 DEBUG: NameError at LINE 470-472 stuck detection: {e}")
             raise
         
-        # Create a compact state signature for stuck detection
+        # Create an extended state signature for curiosity-driven exploration
+        # Includes: exits, health, stamina, prompts, doors, items, location type, combat
         current_signature = (
-            exits.get('total', 0),
-            int(health * 10),  # Quantize to 0-10 range
-            int(stamina * 10)   # Quantize to 0-10 range
+            exits.get('total', 0),           # Total exits visible
+            exits.get('closed_doors', 0),    # Closed doors visible
+            exits.get('open_doors', 0),      # Open doors visible
+            int(health * 10),                # Quantize health to 0-10 range
+            int(stamina * 10),               # Quantize stamina to 0-10 range
+            int(door_state.get('has_open_prompt', False)),  # Door/prompt visible
+            int(door_state.get('has_closable_door', False)),  # Closable door visible
+            int(ground_items_visible),       # Items on ground visible
+            int(self.is_outdoor),            # Are we outdoors
+            int(in_combat)                   # Are we in combat
         )
         
         # Track which directions have walls (movement actions that don't change state)
@@ -494,6 +508,14 @@ class EldenRingEnv(gym.Env):
         # Streamlined counter: increment if state unchanged, reset if changed
         if current_signature == self.last_state_signature:
             self.stuck_consecutive_frames += 1
+            self.consecutive_unchanged_frames += 1
+            
+            # Apply curiosity-driven penalty: increasing penalty for stagnation
+            # Penalty formula: -0.1 * frames_unchanged, capped at -0.5
+            if self.consecutive_unchanged_frames > 3:  # Start penalty after 3 unchanged frames
+                stagnation_penalty = -0.1 * (self.consecutive_unchanged_frames - 5)
+                reward += max(stagnation_penalty, -0.5)  # Cap at -0.5
+            
             # If the last action was movement and state didn't change, it hit a wall or obstacle
             if original_action in movement_map:
                 direction = movement_map[original_action]
@@ -536,6 +558,10 @@ class EldenRingEnv(gym.Env):
             if self.stuck_consecutive_frames >= 10:
                 self.stuck_counter += 1
         else:
+            # State signature changed = exploration reward (curiosity-driven RL)
+            reward += 0.4  # Reward for discovering new state
+            self.consecutive_unchanged_frames = 0  # Reset stagnation counter
+            
             self.stuck_counter = max(0, self.stuck_counter - 1)  # Gradually decrease
             self.stuck_consecutive_frames = 0  # Reset counter on state change
             # If just became unstuck, reset momentum counter to allow fresh movement
@@ -543,6 +569,42 @@ class EldenRingEnv(gym.Env):
                 self.consecutive_frames_in_direction = 0
         
         self.last_state_signature = current_signature
+        
+        # ===== VISUAL CURIOSITY (pixel-level exploration signal) =====
+        # Cheap visual-difference curiosity: reward big visual changes (exploration),
+        # penalize small changes (strafing/standing still)
+        try:
+            # Convert observation to grayscale for visual comparison
+            if observation.ndim == 3:
+                # RGB image - convert to grayscale
+                gray_frame = cv2.cvtColor(observation, cv2.COLOR_RGB2GRAY)
+            else:
+                # Already grayscale
+                gray_frame = observation
+            
+            # Downsample to 8x8 for lightweight computation
+            tiny = cv2.resize(gray_frame, (8, 8), interpolation=cv2.INTER_AREA)
+            
+            # Compute visual difference if we have a previous frame
+            if self.last_tiny_frame is not None:
+                # Mean absolute difference between frames
+                visual_diff = np.mean(np.abs(tiny.astype(float) - self.last_tiny_frame.astype(float)))
+                
+                # Reward significant visual changes (forward movement, exploring new areas)
+                if visual_diff > 5:
+                    reward += 0.1
+                    self.consecutive_low_visual_diff_frames = 0  # Reset stagnation counter
+                # Penalize sustained low visual changes (strafing, standing still, wiggling)
+                else:
+                    self.consecutive_low_visual_diff_frames += 1
+                    if self.consecutive_low_visual_diff_frames > 3:  # Penalty after a few frames
+                        reward -= 0.05
+            
+            # Store current tiny frame for next comparison
+            self.last_tiny_frame = tiny.copy()
+        except Exception as e:
+            print(f"🔴 Visual curiosity error: {e}")
+            # Don't crash on visual processing error, just skip it
         
         # Extract health, stamina, and exits from state
         try:
@@ -1253,32 +1315,63 @@ class EldenRingEnv(gym.Env):
                         # Grant momentum bonus every 10 consecutive frames in same direction
                         if self.consecutive_frames_in_direction % 10 == 0:
                             reward += 0.5  # Bonus for sustained forward movement
+                            reward += 0.3  # Additional bonus every 10 frames for direction continuity
                     else:
+                        # Changing FROM previous direction TO forward
+                        if self.last_movement_action is not None:
+                            # Check direction flip cooldown (prevent rapid reversals)
+                            if self.direction_flip_cooldown > 0:
+                                # Attempting to flip back within cooldown period
+                                reward -= 0.2  # Penalty for attempting direction flip during cooldown
+                            # Check if changing direction too early (before 5+ frame commitment)
+                            elif self.consecutive_frames_in_direction < self.min_frames_before_direction_change:
+                                # Penalize changing direction too early
+                                frames_short = self.min_frames_before_direction_change - self.consecutive_frames_in_direction
+                                reward -= 0.4 * frames_short  # -0.4 per frame short of threshold
                         # Starting new forward movement streak
                         self.consecutive_frames_in_direction = 1
+                        # Track for flip cooldown detection
+                        if self.last_movement_action is not None:
+                            self.last_direction_before_flip = self.last_movement_action
+                            self.direction_flip_cooldown = 5  # 5 frame cooldown before allowing flip back
+                
                 self.last_movement_action = 1
+                self.recent_movement_actions.append(1)  # Track for oscillation detection
+                if len(self.recent_movement_actions) > 5:
+                    self.recent_movement_actions.pop(0)  # Keep only last 5
             else:
                 # All other movement directions get penalized relative to forward
                 reward -= 0.15  # Heavy penalty for non-forward movement (backward/sideways)
                 
+                # Check for lateral oscillation (left-right-left pattern)
+                self.recent_movement_actions.append(action)
+                if len(self.recent_movement_actions) > 5:
+                    self.recent_movement_actions.pop(0)
+                
+                # Detect left-right alternation over last 4 actions
+                if len(self.recent_movement_actions) >= 4:
+                    last_4 = self.recent_movement_actions[-4:]
+                    # Check for alternating left (3) and right (4) pattern
+                    if last_4 == [3, 4, 3, 4] or last_4 == [4, 3, 4, 3]:
+                        reward -= 0.2  # Penalty for detected oscillation
+                
                 # ===== TEMPORAL MOMENTUM: Enforce minimum frame commitment (EXPLORATION ONLY) =====
                 # Penalize frequent direction changes (dithering) to encourage committed movement
-                # This prevents the AI from thrashing left-right-left instead of exploring systematically
-                # PENALTY SCALE (for ±5 training):
-                # - Continuing same direction: +0 (momentum bonus removed, just no penalty)
-                # - Early change at frame 1: -0.45 (worst case: 0.2 + 0.05*5)
-                # - Early change at frame 3: -0.35 (0.2 + 0.05*3)
-                # - Early change at frame 5: -0.25 (0.2 + 0.05*1)
-                # - After min_frames (5+): -0.05 (small penalty to prefer continuity)
-                # - Stuck and changing: -0.1 (allow escaping, light penalty)
                 if not in_combat:
                     # Require 5+ consecutive frames in same direction before allowing direction change
                     if self.last_movement_action == action:
                         # Continuing in same direction - increment counter
                         self.consecutive_frames_in_direction += 1
+                        # Add bonus for staying in same lateral direction
+                        if self.consecutive_frames_in_direction % 10 == 0:
+                            reward += 0.3  # Bonus every 10 frames for direction continuity
                     else:
                         # Attempting to change direction
-                        if self.stuck_counter > 0:
+                        if self.direction_flip_cooldown > 0 and action == self.last_direction_before_flip:
+                            # Attempting to flip back within cooldown period
+                            reward -= 0.2  # Penalty for attempting direction flip during cooldown
+                            self.consecutive_frames_in_direction = 1
+                        elif self.stuck_counter > 0:
                             # Allow direction change when stuck (trying to escape) - small penalty
                             reward -= 0.1  # Light penalty for escaping stuck position
                             self.consecutive_frames_in_direction = 1
@@ -1290,16 +1383,23 @@ class EldenRingEnv(gym.Env):
                             # NOT YET: Changing direction too early - PENALIZE DITHERING
                             # Apply escalating penalty based on how premature the change is
                             frames_short = self.min_frames_before_direction_change - self.consecutive_frames_in_direction
-                            # Penalty grows as frames_short increases (worse the earlier the change)
-                            # Max penalty at frames_short=5: 0.2 + (0.05 * 5) = 0.45
-                            early_change_penalty = 0.2 + (0.05 * frames_short)
-                            reward -= early_change_penalty
+                            reward -= 0.4 * frames_short  # -0.4 per frame short of threshold
                             self.consecutive_frames_in_direction = 1
+                        
+                        # Track for flip cooldown detection
+                        if self.last_movement_action is not None:
+                            self.last_direction_before_flip = self.last_movement_action
+                            self.direction_flip_cooldown = 5  # 5 frame cooldown before allowing flip back
                 else:
                     # Combat mode - allow free direction changes for dodging/positioning
                     self.consecutive_frames_in_direction = 1
                 
                 self.last_movement_action = action
+            
+            # ===== DIRECTION FLIP COOLDOWN DECREMENT (EVERY STEP) =====
+            # Decrement cooldown regardless of which direction was taken
+            if self.direction_flip_cooldown > 0:
+                self.direction_flip_cooldown -= 1
             
             self.consecutive_empty_item_attempts = 0  # Reset item counter
             
@@ -1765,8 +1865,14 @@ class EldenRingEnv(gym.Env):
         self.last_inventory_count = 0  # Reset inventory count tracker
         self.has_wizened_finger = False  # Reset key item acquisition flag
         self.last_movement_action = None  # Reset movement trajectory tracking
+        self.consecutive_frames_in_direction = 0  # Reset direction frame counter for new episode
+        self.direction_flip_cooldown = 0  # Reset direction flip cooldown
+        self.last_direction_before_flip = None  # Reset flip tracking
+        self.recent_movement_actions = []  # Reset oscillation history
         self.message_reads_this_episode = 0  # Reset message read counter for new episode
         self.interact_pending_state_check = False  # Reset interact state check flag
+        self.last_tiny_frame = None  # Reset visual curiosity frame for new episode
+        self.consecutive_low_visual_diff_frames = 0  # Reset visual stagnation counter
         self.interact_prompt_state_when_pressed = False  # Reset saved prompt state
         self.interact_inventory_when_pressed = tuple()  # Reset saved inventory state
         self.last_prompt_hash = None  # Reset prompt hash tracking
@@ -1875,6 +1981,11 @@ class EldenRingEnv(gym.Env):
         self.stuck_directions = {}
         self.direction_wall_attempts = {}
         self.wall_confirmed = set()
+        self.stuck_counter = 0  # Reset stuck counter
+        self.stuck_consecutive_frames = 0  # Reset stuck frame counter
+        self.consecutive_unchanged_frames = 0  # Reset curiosity stagnation counter
+        self.last_tiny_frame = None  # Reset visual curiosity frame for area transition
+        self.consecutive_low_visual_diff_frames = 0  # Reset visual stagnation counter
         
         self.last_area_transition_step = self.steps
         print(f"\n🌍 AREA TRANSITION - Resetting coordinate system at step {self.steps}")

@@ -16,6 +16,8 @@ from datetime import datetime
 from goals import GoalSystem, create_base_game_goals
 import time
 import collections
+import hashlib
+import cv2
 
 # Optional hardware monitoring (gracefully skipped if not available)
 try:
@@ -23,6 +25,75 @@ try:
     HAS_PSUTIL = True
 except ImportError:
     HAS_PSUTIL = False
+
+
+def _hash_prompt_region(frame, prompt_region_y_start=950, prompt_region_y_end=1080, 
+                        prompt_region_x_start=700, prompt_region_x_end=1220, 
+                        downsample_size=(32, 8)):
+    """
+    Create a unique signature for a prompt by hashing its visual appearance.
+    
+    REGION DETAILS (for 1920×1080 screen):
+    - Y-axis: 950-1080 (bottom 130 pixels, 50px buffer above prompt) - captures text like "E :Read message"
+    - X-axis: 700-1220 (center 520 pixels, ~160px padding on each side) - isolates prompt with leeway
+    - This region is where all interactive prompts appear with buffer to avoid edge cutoff
+    
+    This allows the AI to distinguish:
+    - Same prompt tried multiple times (spam detection) - same hash = same prompt
+    - New/different prompt appearing (reset attempt counter) - different hash = new prompt
+    - State changes (white→grey prompt text) - creates different hash signature
+    
+    Process:
+    1. Crop prompt region from frame (bottom-center with buffer)
+    2. Convert to grayscale (removes color variation noise)
+    3. Downsample to tiny size (32×8) - keeps text recognizable, removes noise
+    4. Hash the pixel data with SHA-1
+    
+    Args:
+        frame: BGR image from game (1920x1080x3)
+        prompt_region_y_start: top edge of region (default 950 = includes 50px buffer above prompt)
+        prompt_region_y_end: bottom edge of region (default 1080 = screen bottom)
+        prompt_region_x_start: left edge of region (default 700 = wide left buffer)
+        prompt_region_x_end: right edge of region (default 1220 = wide right buffer)
+        downsample_size: (height, width) for downsampling (32×8 works well for text)
+        
+    Returns:
+        String hash of prompt region (first 8 chars of SHA-1, or None if no valid region)
+    """
+    try:
+        if frame is None or frame.size == 0:
+            return None
+        
+        # Clip bounds to frame dimensions
+        h, w = frame.shape[:2]
+        y_start = max(0, min(prompt_region_y_start, h))
+        y_end = max(y_start + 1, min(prompt_region_y_end, h))
+        x_start = max(0, min(prompt_region_x_start, w))
+        x_end = max(x_start + 1, min(prompt_region_x_end, w))
+        
+        # Extract prompt region
+        prompt_region = frame[y_start:y_end, x_start:x_end]
+        
+        if prompt_region.size == 0:
+            return None
+        
+        # Convert to grayscale
+        if len(prompt_region.shape) == 3:
+            gray = cv2.cvtColor(prompt_region, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = prompt_region
+        
+        # Downsample to small size (reduces noise, speeds up hashing)
+        tiny = cv2.resize(gray, downsample_size, interpolation=cv2.INTER_AREA)
+        
+        # Hash the pixel data
+        hash_obj = hashlib.sha1(tiny.tobytes())
+        return hash_obj.hexdigest()[:8]  # Use first 8 chars for readability
+    
+    except Exception as e:
+        # If hashing fails, return None (hash not available)
+        return None
+
 
 
 class HardwareMonitorCallback(BaseCallback):
@@ -212,7 +283,7 @@ class EldenRingEnv(gym.Env):
         # 17: pan camera down (mouse down)
         # 18: open map (G)
         # NOTE: Action 9 and 13 both use R key; context determines which applies
-        # During exploration: Action 9 (use item) gets -10.0 penalty per Prime Directives
+        # During exploration: Action 9 (use item) gets -0.5 penalty per Prime Directives
 
         self.action_space = spaces.Discrete(19)  # 19 discrete actions (0-18)
         
@@ -268,6 +339,8 @@ class EldenRingEnv(gym.Env):
         self.steps_since_last_door_action = 0  # Track steps spent hovering at door without progress
         self.last_interact_action_step = -999  # Track when we last tried to interact (prevent false positives)
         self.door_attempt_cooldown = 0  # Steps remaining on door attempt cooldown (grace period)
+        self.last_inventory_count = 0  # Track inventory count for door opening validation
+        self.position_when_interacted = None  # Track player position when E was pressed (x, y, z)
         
         # Track failed exits - if AI moves toward an exit and nothing happens, mark it as false
         self.last_exit_count = 0  # Number of exits detected last step
@@ -352,7 +425,10 @@ class EldenRingEnv(gym.Env):
         self.interact_pending_state_check = False  # Waiting to check if last interact caused state change?
         self.interact_prompt_state_when_pressed = False  # Was prompt visible when E was pressed?
         self.interact_inventory_when_pressed = tuple()  # Inventory state when E was pressed (for retry gating)
-        self.last_failed_prompt_location = None  # Track location of last failed interact attempt (for penalty)
+        self.last_prompt_hash = None  # Hash of last prompt we pressed E on
+        self.prompt_attempt_counts = {}  # Track attempts per prompt hash: {hash: attempt_count}
+        self.prompt_hash_stats = {}  # Track success rate per hash: {hash: {'attempts': N, 'successes': N}}
+        self.last_attempted_prompt_hash = None  # Which hash was just attempted (for success logging)
         
     def step(self, action):
         """
@@ -381,7 +457,11 @@ class EldenRingEnv(gym.Env):
         state = self.game_interface.get_game_state()
         
         # Return raw screen image (wrapper will stack frames and convert to grayscale)
-        observation = state['raw_screen']  # Keep as numpy array, wrapper handles conversion
+        try:
+            observation = state['raw_screen']  # Keep as numpy array, wrapper handles conversion
+        except NameError as e:
+            print(f"🔴 DEBUG: NameError at LINE 460 observation = state['raw_screen']: {e}")
+            raise
         
         # NOTE: Actual observation returned to model is handled by FrameStackWrapper
         # This EldenRingEnv step() method returns raw RGB image, which wrapper:
@@ -391,9 +471,13 @@ class EldenRingEnv(gym.Env):
         
         # ===== STUCK DETECTION =====
         # Track location stability using state signature (exits + health + stamina quantized)
-        exits = state.get('exits', {'total': 0})
-        health = state.get('health_percent', 0.0)
-        stamina = state.get('stamina_percent', 0.0)
+        try:
+            exits = state.get('exits', {'total': 0})
+            health = state.get('health_percent', 0.0)
+            stamina = state.get('stamina_percent', 0.0)
+        except NameError as e:
+            print(f"🔴 DEBUG: NameError at LINE 470-472 stuck detection: {e}")
+            raise
         
         # Create a compact state signature for stuck detection
         current_signature = (
@@ -461,18 +545,26 @@ class EldenRingEnv(gym.Env):
         self.last_state_signature = current_signature
         
         # Extract health, stamina, and exits from state
-        health = state.get('health_percent', -1)
-        stamina = state.get('stamina_percent', -1)
-        exits = state.get('exits', {'closed_doors': 0, 'open_doors': 0, 'archways': 0, 'total': 0})
-        quickslots = state.get('quickslots', [False] * 8)
-        is_outdoor = state.get('is_outdoor', False)
-        ground_items_visible = state.get('ground_items_visible', False)
-        door_state = state.get('door_state', {'has_closable_door': False, 'has_open_prompt': False, 'prompt_brightness': 'none', 'prompt_is_white': False})
-        self.in_combat = state.get('in_combat', False)  # Update persistent combat state
+        try:
+            health = state.get('health_percent', -1)
+            stamina = state.get('stamina_percent', -1)
+            exits = state.get('exits', {'closed_doors': 0, 'open_doors': 0, 'archways': 0, 'total': 0})
+            quickslots = state.get('quickslots', [False] * 8)
+            is_outdoor = state.get('is_outdoor', False)
+            ground_items_visible = state.get('ground_items_visible', False)
+            door_state = state.get('door_state', {'has_closable_door': False, 'has_open_prompt': False, 'prompt_brightness': 'none', 'prompt_is_white': False})
+            self.in_combat = state.get('in_combat', False)  # Update persistent combat state
+        except NameError as e:
+            print(f"🔴 DEBUG: NameError at LINE 543-552 main state extraction: {e}")
+            raise
         
         # DETECT WIZENED FINGER PICKUP
         # Check if Wizened Finger is detected in inventory (either quickslots or main inventory)
-        has_wizened_finger_now = state.get('has_wizened_finger', False)
+        try:
+            has_wizened_finger_now = state.get('has_wizened_finger', False)
+        except NameError as e:
+            print(f"🔴 DEBUG: NameError at LINE 560 has_wizened_finger: {e}")
+            raise
         if has_wizened_finger_now and not self.has_wizened_finger:
             # First time detecting the Wizened Finger
             self.has_wizened_finger = True
@@ -480,7 +572,7 @@ class EldenRingEnv(gym.Env):
             reward += 2.0  # MAJOR bonus for picking up required item
             print(f"\n✓ WIZENED FINGER ACQUIRED! Major progression at step {self.steps}")
         
-        # ===== INTERACT STATE-CHANGE DETECTION =====
+        # ===== INTERACT STATE-CHANGE DETECTION (WITH PROMPT HASHING) =====
         # Check if previous interact action caused a state change (successful interaction)
         if self.interact_pending_state_check:
             # We pressed E last step on a valid prompt, now check if anything changed
@@ -488,29 +580,78 @@ class EldenRingEnv(gym.Env):
             current_inventory = tuple(quickslots)
             inventory_changed = current_inventory != self.interact_inventory_when_pressed
             
+            # Get hash of current prompt (if visible)
+            current_prompt_hash = None
+            if current_prompt_visible:
+                try:
+                    current_prompt_hash = _hash_prompt_region(state.get('raw_screen'))
+                except NameError as e:
+                    print(f"🔴 DEBUG: NameError at LINE 576 _hash_prompt_region(state.get('raw_screen')): {e}")
+                    raise
+            
             if not current_prompt_visible and self.interact_prompt_state_when_pressed:
                 # Prompt was visible when we pressed E, but is gone now = PROMPT DISAPPEARED
                 # This indicates the interact was successful (door opened, item picked up, etc.)
-                reward += 20.0
-                self.last_failed_prompt_location = None  # Clear failed attempt tracking on success
+                reward += 4.0  # Was +20.0, reduced to shift focus to movement
+                
+                # Check if this is a novel hash (exploration bonus)
+                if self.last_attempted_prompt_hash and self.last_attempted_prompt_hash not in self.prompt_hash_stats:
+                    reward += 2.0  # Bonus for discovering new prompt type
+                
+                # Track success for this prompt hash
+                if self.last_attempted_prompt_hash:
+                    if self.last_attempted_prompt_hash in self.prompt_hash_stats:
+                        self.prompt_hash_stats[self.last_attempted_prompt_hash]['successes'] += 1
+                    else:
+                        # First time seeing this hash - initialize it
+                        self.prompt_hash_stats[self.last_attempted_prompt_hash] = {'attempts': 1, 'successes': 1}
+                
+                self.prompt_attempt_counts = {}  # Clear all attempt counts on success
+                self.last_prompt_hash = None
             elif inventory_changed:
                 # Inventory changed since we pressed E = STATE CHANGED
                 # AI obtained an item, now might be able to open locked door
-                reward += 20.0
-                self.last_failed_prompt_location = None  # Clear failed attempt tracking on success
+                reward += 4.0  # Was +20.0, reduced to shift focus to movement
+                
+                # Check if this is a novel hash (exploration bonus)
+                if self.last_attempted_prompt_hash and self.last_attempted_prompt_hash not in self.prompt_hash_stats:
+                    reward += 2.0  # Bonus for discovering new prompt type
+                
+                # Track success for this prompt hash
+                if self.last_attempted_prompt_hash:
+                    if self.last_attempted_prompt_hash in self.prompt_hash_stats:
+                        self.prompt_hash_stats[self.last_attempted_prompt_hash]['successes'] += 1
+                    else:
+                        # First time seeing this hash - initialize it
+                        self.prompt_hash_stats[self.last_attempted_prompt_hash] = {'attempts': 1, 'successes': 1}
+                
+                self.prompt_attempt_counts = {}  # Clear attempt counts on inventory change (new game state)
+                self.last_prompt_hash = None
             elif current_prompt_visible and self.interact_prompt_state_when_pressed:
                 # Prompt still visible and inventory unchanged = NO STATE CHANGE
                 # Nothing happened (locked door, already read message, etc.)
                 
-                # Allow ONE free attempt to validate without penalty, then penalize repeats
-                prompt_location = door_state.get('prompt_brightness', 'none')
-                if self.last_failed_prompt_location == prompt_location:
-                    # Already tried this prompt and failed - second attempt, apply penalty
-                    reward -= 0.5
+                # Use prompt hash to track unique prompts
+                if current_prompt_hash is not None:
+                    attempt_count = self.prompt_attempt_counts.get(current_prompt_hash, 0)
+                    
+                    if attempt_count == 0:
+                        # First attempt on this prompt - small reward to encourage trying
+                        reward += 2.0
+                        self.prompt_attempt_counts[current_prompt_hash] = 1
+                    elif attempt_count == 1:
+                        # Second attempt on same prompt - apply penalty
+                        reward -= 0.5
+                        self.prompt_attempt_counts[current_prompt_hash] = 2
+                    else:
+                        # Third+ attempt on same prompt - heavier penalty
+                        reward -= 1.0
+                        self.prompt_attempt_counts[current_prompt_hash] = attempt_count + 1
+                    
+                    self.last_prompt_hash = current_prompt_hash
                 else:
-                    # First failed attempt at this location - neutral, no penalty
-                    # (let AI test if it has the right item)
-                    self.last_failed_prompt_location = prompt_location
+                    # Hash failed (shouldn't happen), fall back to safe penalty
+                    reward -= 0.5
             
             # Clear the pending flag
             self.interact_pending_state_check = False
@@ -538,30 +679,48 @@ class EldenRingEnv(gym.Env):
         
         # ===== DOOR OPENING DETECTION =====
         # Detect when a closed door (interaction prompt visible) becomes open (prompt gone)
-        # CRITICAL: Only reward if we attempted interact action within last 2 steps
-        # This prevents false positives from doors vanishing due to movement
+        # KEY INSIGHT: If prompt disappears and we haven't moved, the door was opened.
+        # If prompt disappears and we HAVE moved away, we just walked away from it.
         door_bonus = 0.0  # Track door-specific bonuses separately
         if self.last_door_state and not door_state['has_closable_door']:
-            # Door was visible/closable before, now it's not
-            # BUT: Only count as "opened" if we recently tried to interact with it
+            # Prompt disappeared - now check if we actually opened it or just moved away
             steps_since_interact = self.steps - self.last_interact_action_step
             if steps_since_interact <= 2 and not self.door_opened_this_episode:
-                # We interacted 1-2 steps ago and door disappeared = we opened it!
-                # ADDITIONAL CHECK: Make sure we actually made meaningful progress
-                # (Not just standing in the same spot)
-                if self.stuck_counter < 5:  # Ensure we're not stuck in one place
-                    self.door_opened_this_episode = True
-                    door_bonus = 10.0  # MASSIVE bonus for opening first door - most valuable event
-                    reward += door_bonus
-                    self.episode_reward += door_bonus
-                    print(f"\n🚪 DOOR OPENED! Major progression! Bonus: +10.0")
+                # We interacted 1-2 steps ago and prompt disappeared
+                # CRITICAL: Check if we stayed in roughly the same position
+                # If position_when_interacted is None, fall back to being conservative
+                if self.position_when_interacted is not None:
+                    try:
+                        current_pos = state.get('player_position', None)
+                    except NameError as e:
+                        print(f"🔴 DEBUG: NameError at LINE 669 state.get('player_position'): {e}")
+                        raise
+                    if current_pos is not None:
+                        # Calculate distance moved since pressing E
+                        dx = current_pos[0] - self.position_when_interacted[0]
+                        dy = current_pos[1] - self.position_when_interacted[1]
+                        dz = current_pos[2] - self.position_when_interacted[2]
+                        distance_moved = (dx**2 + dy**2 + dz**2) ** 0.5
+                        
+                        # If we moved very little (<0.5 units) and prompt is gone, door was definitely opened
+                        if distance_moved < 0.5:
+                            self.door_opened_this_episode = True
+                            door_bonus = 10.0
+                            reward += door_bonus
+                            self.episode_reward += door_bonus
+                            print(f"\n🚪 DOOR OPENED! Major progression! Bonus: +10.0 (stayed in place)")
+                        else:
+                            # We moved away - prompt disappearance might just be from movement
+                            if self.steps % 50 == 0:
+                                print(f"⚠️  Prompt disappeared but we moved {distance_moved:.2f} units away - not counting as door opened")
+                    else:
+                        # Can't determine position, be conservative
+                        if self.steps % 50 == 0:
+                            print(f"⚠️  Prompt disappeared but position unavailable - not counting as door opened")
                 else:
-                    # False positive - door detection glitch while stuck
-                    print(f"⚠️  False door opening detected (stuck at location) - ignoring")
-            else:
-                # Door disappeared but we didn't interact - likely false detection
-                if self.steps % 50 == 0:
-                    print(f"⚠️  Door detection false positive (no interact attempt) at step {self.steps}")
+                    # No position recorded when E was pressed
+                    if self.steps % 50 == 0:
+                        print(f"⚠️  Prompt disappeared but no position record from interact - not counting as door opened")
         
         # ===== DETECT FAILED DOOR ATTEMPT =====
         # If door is still visible after we just tried to interact, it's locked/can't open
@@ -646,6 +805,46 @@ class EldenRingEnv(gym.Env):
         # Update door state tracking for next step
         self.last_door_state = door_state['has_closable_door']
         
+        # Update inventory count for door opening validation
+        try:
+            current_inventory_count = state.get('inventory_count', 0)
+        except NameError as e:
+            print(f"🔴 DEBUG: NameError at LINE 824 state.get('inventory_count'): {e}")
+            raise
+        if current_inventory_count != self.last_inventory_count:
+            self.last_inventory_count = current_inventory_count
+        
+        # ===== VALIDATE MAP STATE (resync with game) =====
+        # Check if map is actually visible in game before calculating rewards
+        try:
+            map_ui_visible = state.get('map_ui_visible', False)
+        except NameError as e:
+            print(f"🔴 DEBUG: NameError at LINE 790 state.get('map_ui_visible'): {e}")
+            raise
+        if self.map_open and not map_ui_visible:
+            # Our tracking says map is open but game says it's closed - resync
+            self.map_open = False
+            self.map_subwindow_open = False
+            self.map_subwindow_opened_step = -1
+        
+        # ===== TRACK INTERACT HASH ATTEMPTS (when pressing E on valid target) =====
+        # Capture the prompt hash when we press E on a valid prompt for success rate tracking
+        if original_action == 12 and door_state.get('has_open_prompt', False):
+            # We're pressing E on a valid prompt - capture its hash for tracking
+            try:
+                current_hash = _hash_prompt_region(state.get('raw_screen'))
+            except NameError as e:
+                print(f"🔴 DEBUG: NameError at LINE 806 _hash_prompt_region(state.get('raw_screen')): {e}")
+                raise
+            if current_hash:
+                # Initialize hash stats if new
+                if current_hash not in self.prompt_hash_stats:
+                    self.prompt_hash_stats[current_hash] = {'attempts': 0, 'successes': 0}
+                # Increment attempts for this hash
+                self.prompt_hash_stats[current_hash]['attempts'] += 1
+                # Track which hash we just attempted
+                self.last_attempted_prompt_hash = current_hash
+        
         # Calculate movement and action rewards using the ORIGINAL action chosen
         # RecurrentPPO doesn't support ActionMasker, so we use reward penalties instead
         action_reward = self._calculate_reward(original_action, health, stamina, invalid=False, exits=exits, quickslots=quickslots, door_state=door_state, ground_items_visible=ground_items_visible, in_combat=self.in_combat)
@@ -660,6 +859,13 @@ class EldenRingEnv(gym.Env):
             print(f"   Actions/sec: {self.steps / (current_time - self.episode_start_time):.1f}")
             print(f"   Last detected: {exits['total']} exits (closed:{exits['closed_doors']} open:{exits['open_doors']} archways:{exits['archways']})")
             print(f"   Chapel exited: {self.chapel_exited} | Boss spawned: {self.boss_spawned}")
+            
+            # Map usage stats
+            if self.action_counts[18] > 0:  # If map has been used at all
+                map_penalty_estimate = self.action_counts[18] * -15.0  # Base penalty per open
+                print(f"   ⚠️  MAP USAGE: {self.action_counts[18]} times - Est. penalty: {map_penalty_estimate:.1f}")
+                print(f"   ❌ INTERACT during map: {self.wasted_interact_during_map} times (penalty: -{self.wasted_interact_during_map * 2.0:.1f})")
+            
             print("=" * 70 + "\n")
             self.last_reward_log_time = current_time
         
@@ -715,8 +921,12 @@ class EldenRingEnv(gym.Env):
         # Detect if AI has reached the boss arena (Godrick spawns when entering the arena)
         # Detection: Boss health bar visible + fog wall visible = boss arena
         if not self.boss_spawned and self.chapel_exited:
-            boss_health = state.get('boss_health_visible', False)
-            fog_wall = state.get('fog_wall_visible', False)
+            try:
+                boss_health = state.get('boss_health_visible', False)
+                fog_wall = state.get('fog_wall_visible', False)
+            except NameError as e:
+                print(f"🔴 DEBUG: NameError at LINE 906-907 boss_health/fog_wall: {e}")
+                raise
             
             # Boss is spawned when we see the health bar and/or fog wall
             if boss_health or fog_wall:
@@ -932,6 +1142,7 @@ class EldenRingEnv(gym.Env):
                 if not self.map_open:
                     # Opening map - SEVERE penalty (termination happens in step())
                     reward -= 15.0  # Severe penalty applied here
+                    print(f"🗺️  MAP OPENED at step {self.steps} - Penalty: -15.0")
                     
                     # Check if reopening within 30-second window
                     if self.map_last_closed_step >= 0:
@@ -939,25 +1150,31 @@ class EldenRingEnv(gym.Env):
                         if steps_since_close < self.map_reopen_cooldown_steps:
                             # Reopening too soon - additional harsh penalty
                             reward -= 10.0  # Extra penalty for habitual map checking
+                            print(f"   ⚠️  REOPENED TOO SOON! Only {steps_since_close} steps since close - Extra penalty: -10.0")
+                            print(f"   Total penalty this step: -25.0")
                     
                     self.map_open = True
                     self.map_opened_step = self.steps
                     self.consecutive_map_actions = 0  # Reset counter when opening
+                    # NO early return - let per-step penalty also apply since map is now open
                 else:
-                    # Closing map with G - minimal recovery
+                    # Closing map with G - reward for fast close (no penalty, just bonus)
                     frames_open = self.steps - self.map_opened_step
                     if frames_open <= 1:  # Closed within 1 frame of opening
-                        reward += 0.1  # Minimal bonus
+                        reward += 1.0  # Strong reward for immediately closing map
+                        print(f"🗺️  MAP CLOSED IMMEDIATELY at step {self.steps} (open for {frames_open} frames) - Bonus: +1.0")
+                    else:
+                        print(f"🗺️  MAP CLOSED at step {self.steps} (was open for {frames_open} frames)")
                     self.map_open = False
                     self.map_last_closed_step = self.steps  # Track when map was closed
                     self.consecutive_map_actions = 0  # Reset counter when closing
-                return reward  # Early return - suppress all other rewards when map is touched
+                    return reward  # Early return - only for closing, to prevent per-step penalty
             
             # Close map with Q (lock-on button) when map is open
             if action == 10 and self.map_open:  # Q pressed while map open
                 frames_open = self.steps - self.map_opened_step
                 if frames_open <= 1:  # Closed within 1 frame of opening
-                    reward += 0.1  # Minimal recovery
+                    reward += 1.0  # Strong reward for immediately closing map
                 
                 # Handle subwindow closure
                 if self.map_subwindow_open:
@@ -971,27 +1188,37 @@ class EldenRingEnv(gym.Env):
                     self.map_last_closed_step = self.steps  # Track when map was closed
                 
                 self.consecutive_map_actions = 0  # Reset counter
+                return reward  # Early return - only give close reward, suppress all other rewards
             elif self.map_open and action not in [18]:  # Any OTHER action while map is open (except G which is handled separately)
-                # Action taken while map is open = wasting time
+                # Action taken while map is open - continuous penalty already applied above
+                # NOTE: Map state validation happens in step() before calling this function
+                # If we reach here and self.map_open is True, map IS actually open in game
                 
-                # SUPPRESS INTERACT DURING MAP: Track and penalize wasted interact presses
+                # Still track interact presses for diagnostics
                 if action == 12:  # Interact pressed while map is open
-                    reward -= 2.0  # Specific penalty for wasted E press
                     self.wasted_interact_during_map += 1
+                    print(f"   ⚠️  INTERACT pressed during MAP (step {self.steps})")
                 
                 if self.map_subwindow_open:
                     # IN SUBWINDOW: Q is the only valid action, everything else gets penalized
                     if action != 10:  # Not Q
                         self.consecutive_map_actions += 1
-                        # Progressive penalty for any non-Q action in subwindow: -0.5, -0.75, -1.0, -1.0...
-                        progressive_penalty = -0.5 - (min(self.consecutive_map_actions - 1, 2) * 0.25)
-                        reward += progressive_penalty
+                        # Additional penalty for wrong action in subwindow
+                        subwindow_penalty = -0.3
+                        reward += subwindow_penalty
+                        print(f"   ⚠️  Non-Q action in subwindow at step {self.steps} (action {action}) - Penalty: {subwindow_penalty}")
                 else:
                     # IN MAIN MAP: Any non-Q action opens/interacts with subwindow
                     self.map_subwindow_open = True
                     self.map_subwindow_opened_step = self.steps
-                    # Opening subwindow gets a small penalty
-                    reward -= 0.3  # Light penalty for opening subwindow
+                    print(f"   ℹ️  Subwindow opened at step {self.steps}")
+            
+            # ========== PER-STEP MAP PENALTY (After close detection) ==========
+            # If we reach here and map is still open, apply the per-step penalty
+            # Close actions (G toggle or Q) have early returns, so they never reach here
+            # Only non-close actions trigger this penalty
+            if self.map_open:
+                reward -= 0.5  # Continuous penalty for having map open - encourages closing it
             
             # Prime Directive 5: Forward movement is default
             if action == 2:  # Moving backward
@@ -1017,12 +1244,18 @@ class EldenRingEnv(gym.Env):
                     else:  # Just started getting stuck
                         reward -= 0.75  # Light penalty to encourage trying different direction
                 else:
-                    reward += 1.0  # MASSIVELY increased: Was 0.45, now 1.0
-                                    # Total for forward: +1.0 bonus alone
+                    reward += 1.5  # Was 1.0, increased to 1.5 to make movement more attractive
+                                    # Total for forward: +1.5 bonus alone
                     
-                    # MOMENTUM BONUS: Reward continuing forward if that was last action
+                    # MOMENTUM BONUS: Reward continuing forward if that was last action (+0.5 per 10 frames)
                     if self.last_movement_action == 1:
-                        reward += 0.25  # Bonus for maintaining trajectory
+                        self.consecutive_frames_in_direction += 1
+                        # Grant momentum bonus every 10 consecutive frames in same direction
+                        if self.consecutive_frames_in_direction % 10 == 0:
+                            reward += 0.5  # Bonus for sustained forward movement
+                    else:
+                        # Starting new forward movement streak
+                        self.consecutive_frames_in_direction = 1
                 self.last_movement_action = 1
             else:
                 # All other movement directions get penalized relative to forward
@@ -1125,6 +1358,9 @@ class EldenRingEnv(gym.Env):
                 reward -= 0.2  # INCREASED: Was -0.01, now -0.2 (lock-on is combat prep)
             
             elif action == 12:  # Interact (STATE-CHANGE GATED)
+                # Reset momentum counter when interact action is taken
+                self.consecutive_frames_in_direction = 0
+                
                 # Only reward interact when there's a valid target
                 # Reward is determined by whether the interact causes a state change
                 if door_state.get('has_open_prompt', False):
@@ -1147,6 +1383,13 @@ class EldenRingEnv(gym.Env):
                 else:
                     # NO VALID TARGET: Wasting the interact action
                     self.wasted_interact_count += 1
+                    
+                    # Check for repetition penalty: if this hash has 0% success, penalize further attempts
+                    if self.last_attempted_prompt_hash and self.last_attempted_prompt_hash in self.prompt_hash_stats:
+                        hash_stats = self.prompt_hash_stats[self.last_attempted_prompt_hash]
+                        if hash_stats['successes'] == 0 and hash_stats['attempts'] >= 1:
+                            # This hash has never succeeded - strong penalty for trying again
+                            reward -= 1.0  # Penalty for beating dead horse (locked door without key, etc.)
                     
                     # COOLDOWN ON FAILED INTERACT: Penalize spamming E when nothing is there (REDUCED)
                     steps_since_last_interact = self.steps - self.last_interact_action_step
@@ -1381,6 +1624,45 @@ class EldenRingEnv(gym.Env):
         elif movement_pct > 90:
             report_lines.append(f"  ℹ️  High movement ratio ({movement_pct:.1f}%) - focused on navigation")
         
+        # Prompt hash statistics section
+        if self.prompt_hash_stats:
+            report_lines.append("\n" + "=" * 70)
+            report_lines.append("PROMPT HASH STATISTICS - Success Rates by Visual Signature")
+            report_lines.append("=" * 70)
+            report_lines.append(f"\n{'Hash':<12} {'Attempts':<10} {'Successes':<10} {'Success Rate':<15} {'Notes'}")
+            report_lines.append("-" * 70)
+            
+            # Sort by attempts (most tested first)
+            sorted_hashes = sorted(self.prompt_hash_stats.items(), 
+                                 key=lambda x: x[1]['attempts'], 
+                                 reverse=True)
+            
+            for hash_val, stats in sorted_hashes:
+                attempts = stats['attempts']
+                successes = stats['successes']
+                success_rate = (successes / attempts * 100) if attempts > 0 else 0.0
+                
+                # Determine status notes
+                if success_rate == 100:
+                    notes = "✓ All attempts succeeded"
+                elif success_rate == 0:
+                    notes = "✗ All attempts failed"
+                elif success_rate > 75:
+                    notes = "✓ Mostly successful"
+                elif success_rate > 50:
+                    notes = "⚠ Mixed results"
+                else:
+                    notes = "✗ Mostly failures"
+                
+                report_lines.append(f"{hash_val:<12} {attempts:<10} {successes:<10} {success_rate:>6.1f}%         {notes}")
+            
+            report_lines.append("-" * 70)
+            report_lines.append(f"\nTotal unique prompt signatures: {len(self.prompt_hash_stats)}")
+            total_attempts = sum(s['attempts'] for s in self.prompt_hash_stats.values())
+            total_successes = sum(s['successes'] for s in self.prompt_hash_stats.values())
+            overall_success_rate = (total_successes / total_attempts * 100) if total_attempts > 0 else 0.0
+            report_lines.append(f"Overall prompt success rate: {overall_success_rate:.1f}%")
+        
         report_lines.append("=" * 70 + "\n")
         
         # Print the report to console
@@ -1479,17 +1761,38 @@ class EldenRingEnv(gym.Env):
         self.last_door_state = False  # Reset last door state
         self.steps_since_last_door_action = 0  # Reset door hover counter
         self.last_interact_action_step = -999  # Reset interact action tracker
+        self.position_when_interacted = None  # Reset position tracker
+        self.last_inventory_count = 0  # Reset inventory count tracker
         self.has_wizened_finger = False  # Reset key item acquisition flag
         self.last_movement_action = None  # Reset movement trajectory tracking
         self.message_reads_this_episode = 0  # Reset message read counter for new episode
         self.interact_pending_state_check = False  # Reset interact state check flag
         self.interact_prompt_state_when_pressed = False  # Reset saved prompt state
         self.interact_inventory_when_pressed = tuple()  # Reset saved inventory state
-        self.last_failed_prompt_location = None  # Reset failed prompt tracking
+        self.last_prompt_hash = None  # Reset prompt hash tracking
+        self.prompt_attempt_counts = {}  # Reset per-prompt attempt counts
+        
+        # NOTE: DO NOT reset map state or subwindow state - preserve across episodes
+        # The game doesn't reset between episodes, so if the map/subwindow are open,
+        # they will still be open at the start of the next episode.
+        # Our tracking must reflect the actual game state persistently.
+        # However, RESET the step counters so duration calculations work for THIS episode
+        if self.map_open:
+            self.map_opened_step = 0  # Map is still open, but reset step counter for new episode
+        if self.map_subwindow_open:
+            self.map_subwindow_opened_step = 0  # Subwindow is still open, but reset step counter
         
         # Get initial state
         state = self.game_interface.get_game_state()
         observation = state['raw_screen']  # Return raw image for wrapper to process
+        
+        # Sync map tracking with actual game state
+        # If map_opened_step was set but now steps=0, update it so frame calc is correct
+        if self.map_open and self.map_opened_step > 0:
+            # Map was open in previous episode, preserve the open state
+            # but reset the step counter for this new episode
+            self.map_opened_step = 0  # Map is still open, but now at step 0 of new episode
+            print(f"ℹ️  Map persisted from previous episode - still open, applying penalties...")
         
         # CHECK: Do we already have the Wizened Finger? (in case restarting mid-session)
         quickslots = state.get('quickslots', [False] * 8)

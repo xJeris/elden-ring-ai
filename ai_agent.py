@@ -481,8 +481,12 @@ class EldenRingEnv(gym.Env):
             exits = state.get('exits', {'total': 0})
             health = state.get('health_percent', 0.0)
             stamina = state.get('stamina_percent', 0.0)
+            ground_items_visible = state.get('ground_items_visible', False)
+            door_state = state.get('door_state', {'has_closable_door': False, 'has_open_prompt': False, 'prompt_brightness': 'none', 'prompt_is_white': False})
+            in_combat = state.get('in_combat', False)
+            is_outdoor = state.get('is_outdoor', False)
         except NameError as e:
-            print(f"🔴 DEBUG: NameError at LINE 470-472 stuck detection: {e}")
+            print(f"🔴 DEBUG: NameError at LINE 480-488 stuck detection: {e}")
             raise
         
         # Create an extended state signature for curiosity-driven exploration
@@ -496,7 +500,7 @@ class EldenRingEnv(gym.Env):
             int(door_state.get('has_open_prompt', False)),  # Door/prompt visible
             int(door_state.get('has_closable_door', False)),  # Closable door visible
             int(ground_items_visible),       # Items on ground visible
-            int(self.is_outdoor),            # Are we outdoors
+            int(is_outdoor),                 # Are we outdoors
             int(in_combat)                   # Are we in combat
         )
         
@@ -606,18 +610,13 @@ class EldenRingEnv(gym.Env):
             print(f"🔴 Visual curiosity error: {e}")
             # Don't crash on visual processing error, just skip it
         
-        # Extract health, stamina, and exits from state
+        # Extract remaining state variables needed for reward/action logic
         try:
-            health = state.get('health_percent', -1)
-            stamina = state.get('stamina_percent', -1)
-            exits = state.get('exits', {'closed_doors': 0, 'open_doors': 0, 'archways': 0, 'total': 0})
             quickslots = state.get('quickslots', [False] * 8)
-            is_outdoor = state.get('is_outdoor', False)
-            ground_items_visible = state.get('ground_items_visible', False)
-            door_state = state.get('door_state', {'has_closable_door': False, 'has_open_prompt': False, 'prompt_brightness': 'none', 'prompt_is_white': False})
-            self.in_combat = state.get('in_combat', False)  # Update persistent combat state
+            # Note: health, stamina, exits, ground_items_visible, door_state, in_combat, is_outdoor already extracted above
+            self.in_combat = state.get('in_combat', False)  # Update persistent combat state (already extracted)
         except NameError as e:
-            print(f"🔴 DEBUG: NameError at LINE 543-552 main state extraction: {e}")
+            print(f"🔴 DEBUG: NameError at LINE 615-620 remaining state extraction: {e}")
             raise
         
         # DETECT WIZENED FINGER PICKUP

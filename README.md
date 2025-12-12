@@ -69,8 +69,8 @@ Tracks 10 attributes of game state:
 - Combat status
 
 **Rewards & Penalties:**
-- **State Change**: +0.4 reward whenever any attribute changes (was +0.2)
-- **Stagnation Penalty**: -0.1 per frame after 3 unchanged frames (was 5), capped at -0.5
+- **State Change**: +0.4 reward whenever any attribute changes
+- **Stagnation Penalty**: -0.1 per frame after 3 unchanged frames, capped at -0.5
 - **Purpose**: Encourages exploring new areas, meeting new NPCs, finding new exits
 
 **Behavior Target:**
@@ -122,7 +122,7 @@ This design:
 - Resets the free attempt when inventory changes (AI can try again after getting the item)
 
 ### Movement (Now Primary Focus + Direction Stability)
-- **Forward Movement**: +1.5 (was +1.0, increased to compete with lower interact rewards)
+- **Forward Movement**: +1.5 
 - **Movement Momentum**: +0.5 every 10 consecutive frames in same direction (NEW - encourages sustained exploration)
 - **Momentum Reset**: Resets to 0 whenever interact action is taken
 - **Backward Movement**: -0.5 (opposite of goal)
@@ -148,13 +148,13 @@ Prevents AI from switching directions rapidly to farm micro-rewards without real
 **Purpose:** Forces coherent exploration paths instead of dithering at decision points
 
 ### Interact Actions (Secondary Strategy)
-- **Interact with Valid Prompt (State Change)**: +4.0 base (reduced from +20.0)
+- **Interact with Valid Prompt (State Change)**: +4.0 base
 - **Interact with NEW Hash (Novelty)**: +2.0 bonus (NEW - discovery reward)
 - **Interact on 0% Success Hash (Repetition)**: -1.0 penalty (NEW - stops dead-end spamming)
 - **Interact Attempt (No State Change, First Try)**: +0.0 (neutral - test if door is locked)
 - **Interact Attempt (No State Change, Retry)**: -0.5 (penalty for re-spamming)
 - **Spam within 5 steps of last attempt**: -1.0 (rapid re-attempt penalty)
-- **Ground Items Pickup**: +0.7 (unchanged - utility loot)
+- **Ground Items Pickup**: +0.7 (utility loot)
 - **Dwell Time Penalty**: -0.5 per step after 2+ consecutive steps of visible prompt without pressing E (exploration only)
 
 ### Item Interaction
@@ -169,9 +169,9 @@ Prevents AI from switching directions rapidly to farm micro-rewards without real
 
 ### Combat Actions (Prime Directives)
 - **Attack Actions (Normal/Heavy)**: -0.2 (combat avoided during exploration)
-- **Backstep/Dodge**: -1.0 (EXTREME penalty - never dodge during exploration)
+- **Backstep/Dodge**: -1.0 (never dodge during exploration)
 - **Jump**: -1.0 (EXTREME penalty - never jump during exploration)
-- **Using Items**: -0.5 (normalized from -2.0, strict constraint in exploration)
+- **Using Items**: -0.5 (strict constraint in exploration)
 - **Lock-on**: -0.2 (combat prep, avoided)
 - **Skill**: -0.3 (skill use avoided)
 - **Summon Mount**: -0.1 (unavailable, minimal penalty)
@@ -321,7 +321,7 @@ python analyze_training.py
 - ✅ Added map state resync logic to prevent false subwindow penalties
 - ✅ Added comprehensive debug logging (9 try-catch blocks at state access points)
 - ✅ Verified all state parameter scoping is correct
-- ✅ Fixed comment inaccuracy (Action 9 penalty: -0.5, was documented as -10.0)
+- ✅ Fixed comment inaccuracy (Action 9 penalty: -0.5)
 - ✅ Verified all 14 penalty-related comments are accurate to current code
 
 **Phase 2: Reward Shaping Rebalance (Movement Focus)**
@@ -338,13 +338,13 @@ python analyze_training.py
 - ✅ **Direction flip cooldown**: 5 steps duration with -0.2 penalty if violated (NEW)
 - ✅ **Lateral oscillation detection**: -0.2 penalty for [3,4,3,4] or [4,3,4,3] patterns (NEW)
 - ✅ **Momentum reset on interact**: `consecutive_frames_in_direction = 0` when action 12 taken
-- ✅ **Cooldown decrement fix**: Now decrements EVERY movement step (was only during forward)
+- ✅ **Cooldown decrement fix**: Now decrements EVERY movement step
 - ✅ **Consecutive frames reset**: Fixed missing reset in `reset()` method at episode start
 
 **Phase 4: Curiosity-Driven Exploration System**
 - ✅ **Extended state signature**: 3 attributes → 10 attributes (exits, doors, health, stamina, prompts, items, location, combat)
-- ✅ **State-signature curiosity**: +0.4 reward on state change (was +0.2), -0.1 escalating penalty for stagnation
-- ✅ **Stagnation detection threshold**: 3 frames (was 5) – more aggressive exploration
+- ✅ **State-signature curiosity**: +0.4 reward on state change, -0.1 escalating penalty for stagnation
+- ✅ **Stagnation detection threshold**: 3 frames – more aggressive exploration
 - ✅ **Penalty cap**: -0.5 maximum stagnation penalty
 - ✅ **Visual pixel-level curiosity** (NEW): 
   - Downsample frame to 8×8 for lightweight processing
@@ -377,29 +377,6 @@ python analyze_training.py
 - Exploration quality: Improved by dual curiosity layers (state + pixel)
 - Standing still/strafing: Heavily penalized by visual curiosity signal
 
-## Performance Metrics
-
-### Previous Training Session (26,374 steps, 19 episodes)
-- **Interact**: 25.53% (8,995 attempts) - **TARGET: Reduce to ~10%**
-- **Move Forward**: 11.52% (4,058 actions) - **TARGET: Increase to 50-60%**
-- **Move Left/Right**: 15.71% (5,532 actions combined)
-- **Camera Actions**: ~13% combined
-- **Combat Actions**: <5% (correctly avoided)
-- **Prompt Success Rate**: 48% overall (98 unique hashes, 47 successful)
-
-### Hash Analytics from Previous Training
-- Total unique prompt signatures: 98
-- Successful prompts (100% success): 47
-- Failed prompts (0% success): 49 (locked doors, dead-ends)
-- Overall prompt success rate: 48.0%
-
-**Insight**: The 49 failed-hash attempts (50% of prompts) will now be penalized with -1.0, encouraging movement exploration instead of prompt spam.
-
-### Training Characteristics
-- **Learned behavior**: AI no longer avoids doors; presses E on valid prompts
-- **Spam control**: State-change detection prevents infinite message reading
-- **Test-and-retry**: Free attempt on locked doors encourages persistence with inventory changes
-
 ## Code Architecture
 
 ### State Management
@@ -425,7 +402,7 @@ To adjust exploration behavior, modify values in [ai_agent.py](ai_agent.py) step
 - **State change reward (+0.4)**: Bonus when any of 10 state attributes changes (exits, doors, health, stamina, prompts, items, location, combat)
 - **Stagnation penalty (-0.1)**: Applied per frame after 3 unchanged frames
 - **Penalty cap (-0.5)**: Maximum accumulated stagnation penalty
-- **Stagnation threshold (3 frames)**: Frames before penalty starts (was 5, now more aggressive)
+- **Stagnation threshold (3 frames)**: Frames before penalty starts
 
 **Visual Pixel Curiosity** (lines 572-600):
 - **Large visual change (+0.1)**: Reward threshold at diff > 5 (indicates forward movement, exploration)
@@ -451,7 +428,7 @@ To adjust direction stability, modify values in [ai_agent.py](ai_agent.py) step(
 
 ### Interact Reward System
 To adjust interact behavior, modify values in [ai_agent.py](ai_agent.py) step() method (lines 590-625, 1360-1400):
-- **Successful state-change (+4.0)**: Base reward for prompt/inventory change (was +20.0)
+- **Successful state-change (+4.0)**: Base reward for prompt/inventory change
 - **Novelty bonus (+2.0)**: Extra reward for discovering new prompt hash (NEW)
 - **Repetition penalty (-1.0)**: Applied when interacting on 0% success hash (NEW)
 - **Failed attempt, first try (+0.0)**: Free test on locked doors
@@ -462,7 +439,7 @@ To adjust interact behavior, modify values in [ai_agent.py](ai_agent.py) step() 
 
 ### Movement Reward System
 To adjust movement behavior, modify values in [ai_agent.py](ai_agent.py) step() method (lines 1240-1280):
-- **Forward movement (+1.5)**: Base reward per step forward (was +1.0)
+- **Forward movement (+1.5)**: Base reward per step forward
 - **Movement momentum (+0.5)**: Bonus every 10 consecutive frames in same direction (NEW)
 - **Momentum reset**: Automatically resets to 0 when interact action (12) is taken (NEW)
 - **Backward movement (-0.5)**: Penalty for moving opposite direction
@@ -499,3 +476,4 @@ To adjust overall AI behavior, modify reward values:
 ## License
 
 Educational project for reinforcement learning research.
+

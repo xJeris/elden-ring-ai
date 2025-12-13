@@ -18,6 +18,7 @@ import time
 import collections
 import hashlib
 import cv2
+import json
 
 # Optional hardware monitoring (gracefully skipped if not available)
 try:
@@ -439,8 +440,34 @@ class EldenRingEnv(gym.Env):
         self.interact_inventory_when_pressed = tuple()  # Inventory state when E was pressed (for retry gating)
         self.last_prompt_hash = None  # Hash of last prompt we pressed E on
         self.prompt_attempt_counts = {}  # Track attempts per prompt hash: {hash: attempt_count}
-        self.prompt_hash_stats = {}  # Track success rate per hash: {hash: {'attempts': N, 'successes': N}}
+        self.prompt_hash_stats = {}  # Track stats per hash: {hash: {'attempts': N, 'door_successes': N, 'last_attempt_step': N}}
         self.last_attempted_prompt_hash = None  # Which hash was just attempted (for success logging)
+        
+        # 5-LAYER ANTI-FARMING SYSTEM TRACKING
+        self.prompt_last_reward_step = {}  # Per-hash cooldown: {hash: step_when_last_rewarded}
+        self.steps_since_last_interact_reward = 0  # Global cooldown: steps since ANY interact was rewarded
+        
+        # Layer constants (tunable)
+        self.DOOR_INTERACT_REWARD = 4.0  # Full reward for proven doors
+        self.NON_DOOR_INTERACT_REWARD = 0.2  # Tiny reward for non-door prompts
+        self.PER_HASH_COOLDOWN = 50  # Steps before same hash can be rewarded again
+        self.GLOBAL_INTERACT_COOLDOWN = 10  # Steps before any interact can be rewarded
+        self.PER_HASH_PENALTY = 0.25  # Penalty when per-hash cooldown active
+        self.GLOBAL_PENALTY = 0.1  # Penalty when global cooldown active
+        self.ATTEMPT_THRESHOLD = 2  # Escalation triggers after this many attempts
+        self.ESCALATION_MULTIPLIER = 0.5  # Base escalation penalty scaling
+        self.ESCALATION_CAP = 1.5  # Max escalation penalty (prevents deadlock: 0.2 - 1.5 = -1.3 worst case)
+        self.ATTEMPT_DECAY_INTERVAL = 200  # Steps between attempt count decay
+        self.ATTEMPT_DECAY_FACTOR = 0.5  # Multiply attempts by this factor after interval
+        self.GLOBAL_DECAY_INTERVAL = 300  # Global decay loop: apply decay to ALL hashes every 300 steps
+        
+        # Telemetry for tuning (reset each episode)
+        self.telemetry_door_rewards = 0  # Count of full door rewards granted
+        self.telemetry_non_door_rewards = 0  # Count of tiny non-door rewards
+        self.telemetry_escalations_applied = 0  # Count of escalation penalties applied
+        self.telemetry_per_hash_cooldown_hits = 0  # Times Layer 2 triggered
+        self.telemetry_global_cooldown_hits = 0  # Times Layer 3 triggered
+        self.last_global_decay_step = 0  # Track when we last ran global decay
         
     def step(self, action):
         """
@@ -452,6 +479,20 @@ class EldenRingEnv(gym.Env):
         Returns:
             observation, reward, terminated, truncated, info
         """
+        # ===== GLOBAL COOLDOWN MANAGEMENT (d) =====
+        # Increment global cooldown counter EVERY step (ages the global interact cooldown)
+        self.steps_since_last_interact_reward += 1
+        
+        # ===== GLOBAL DECAY LOOP (c) =====
+        # Periodically decay ALL hash attempt counts to prevent permanent lockout
+        if self.steps - self.last_global_decay_step > self.GLOBAL_DECAY_INTERVAL:
+            for hash_key, stats in self.prompt_hash_stats.items():
+                old_attempts = stats.get('attempts', 0)
+                decayed = int(old_attempts * self.ATTEMPT_DECAY_FACTOR)
+                if decayed < old_attempts:
+                    stats['attempts'] = decayed
+            self.last_global_decay_step = self.steps
+        
         # Initialize reward for this step - all bonuses/penalties accumulate here
         reward = 0.0
         
@@ -698,13 +739,17 @@ class EldenRingEnv(gym.Env):
                 if self.last_attempted_prompt_hash and self.last_attempted_prompt_hash not in self.prompt_hash_stats:
                     reward += 2.0  # Bonus for discovering new prompt type
                 
-                # Track success for this prompt hash
+                # Track success for this prompt hash - mark as door success if prompted state was white
                 if self.last_attempted_prompt_hash:
                     if self.last_attempted_prompt_hash in self.prompt_hash_stats:
-                        self.prompt_hash_stats[self.last_attempted_prompt_hash]['successes'] += 1
+                        self.prompt_hash_stats[self.last_attempted_prompt_hash]['door_successes'] += 1
                     else:
                         # First time seeing this hash - initialize it
-                        self.prompt_hash_stats[self.last_attempted_prompt_hash] = {'attempts': 1, 'successes': 1}
+                        self.prompt_hash_stats[self.last_attempted_prompt_hash] = {
+                            'attempts': 1,
+                            'door_successes': 1,
+                            'last_attempt_step': self.steps
+                        }
                 
                 self.prompt_attempt_counts = {}  # Clear all attempt counts on success
                 self.last_prompt_hash = None
@@ -717,41 +762,97 @@ class EldenRingEnv(gym.Env):
                 if self.last_attempted_prompt_hash and self.last_attempted_prompt_hash not in self.prompt_hash_stats:
                     reward += 2.0  # Bonus for discovering new prompt type
                 
-                # Track success for this prompt hash
+                # Track success for this prompt hash - mark as door success
                 if self.last_attempted_prompt_hash:
                     if self.last_attempted_prompt_hash in self.prompt_hash_stats:
-                        self.prompt_hash_stats[self.last_attempted_prompt_hash]['successes'] += 1
+                        self.prompt_hash_stats[self.last_attempted_prompt_hash]['door_successes'] += 1
                     else:
                         # First time seeing this hash - initialize it
-                        self.prompt_hash_stats[self.last_attempted_prompt_hash] = {'attempts': 1, 'successes': 1}
+                        self.prompt_hash_stats[self.last_attempted_prompt_hash] = {
+                            'attempts': 1,
+                            'door_successes': 1,
+                            'last_attempt_step': self.steps
+                        }
                 
-                self.prompt_attempt_counts = {}  # Clear attempt counts on inventory change (new game state)
+                self.prompt_attempt_counts = {}  # Clear old attempt counts on inventory change (new game state)
                 self.last_prompt_hash = None
             elif current_prompt_visible and self.interact_prompt_state_when_pressed:
                 # Prompt still visible and inventory unchanged = NO STATE CHANGE
                 # Nothing happened (locked door, already read message, etc.)
+                # NOTE: This logic is DEPRECATED - 5-layer system (Layer 5) handles escalation better
+                # Keep for backward compatibility but prefer the new layer system (e)
                 
                 # Use prompt hash to track unique prompts
                 if current_prompt_hash is not None:
-                    attempt_count = self.prompt_attempt_counts.get(current_prompt_hash, 0)
+                    # Consolidate: derive from prompt_hash_stats instead of separate prompt_attempt_counts (e)
+                    if current_prompt_hash not in self.prompt_hash_stats:
+                        self.prompt_hash_stats[current_prompt_hash] = {
+                            'attempts': 0,
+                            'door_successes': 0,
+                            'last_attempt_step': -9999
+                        }
+                    
+                    attempt_count = self.prompt_hash_stats[current_prompt_hash].get('attempts', 0)
                     
                     if attempt_count == 0:
                         # First attempt on this prompt - small reward to encourage trying
                         reward += 2.0
-                        self.prompt_attempt_counts[current_prompt_hash] = 1
                     elif attempt_count == 1:
                         # Second attempt on same prompt - apply penalty
                         reward -= 0.5
-                        self.prompt_attempt_counts[current_prompt_hash] = 2
                     else:
                         # Third+ attempt on same prompt - heavier penalty
                         reward -= 1.0
-                        self.prompt_attempt_counts[current_prompt_hash] = attempt_count + 1
                     
                     self.last_prompt_hash = current_prompt_hash
                 else:
                     # Hash failed (shouldn't happen), fall back to safe penalty
                     reward -= 0.5
+            
+            # ===== PARTIAL DOOR SIGNAL DETECTION (g) =====
+            # Detect door opening animation/progress even if not fully open yet
+            # This helps bootstrap door_successes for greyed/animated doors
+            if self.interact_pending_state_check and self.last_attempted_prompt_hash:
+                partial_door_opened = False
+                
+                # Check 1: Prompt changed from white to grey (door animation started)
+                prompt_brightness = door_state.get('prompt_brightness', 'none')
+                if (self.interact_prompt_state_when_pressed and current_prompt_visible and 
+                    hasattr(self, '_interact_pressed_prompt_white') and self._interact_pressed_prompt_white and
+                    prompt_brightness == 'grey'):
+                    partial_door_opened = True
+                    reward += 0.5  # Small bonus for animation start
+                
+                # Check 2: Player moved forward significantly (position delta > threshold)
+                if self.position_when_interacted is not None:
+                    try:
+                        current_pos = state.get('player_position', None)
+                    except NameError:
+                        current_pos = None
+                    
+                    if current_pos is not None:
+                        position_delta = current_pos[0] - self.position_when_interacted[0]  # Forward component
+                        if position_delta > 0.5:  # Threshold for "forward movement"
+                            partial_door_opened = True
+                            reward += 0.3  # Bonus for forward progress
+                
+                # Check 3: Exits increased (new doors/areas unlocked)
+                if exits['total'] > getattr(self, '_last_exit_count_at_interact', 0):
+                    partial_door_opened = True
+                    reward += 0.2  # Bonus for new areas
+                
+                # If ANY partial signal detected, mark as door success
+                if partial_door_opened:
+                    if self.last_attempted_prompt_hash not in self.prompt_hash_stats:
+                        self.prompt_hash_stats[self.last_attempted_prompt_hash] = {
+                            'attempts': 1,
+                            'door_successes': 1,
+                            'last_attempt_step': self.steps
+                        }
+                    else:
+                        self.prompt_hash_stats[self.last_attempted_prompt_hash]['door_successes'] += 1
+                    # Reset attempts after partial success (bootstrapping)
+                    self.prompt_hash_stats[self.last_attempted_prompt_hash]['attempts'] = 0
             
             # Clear the pending flag
             self.interact_pending_state_check = False
@@ -939,23 +1040,110 @@ class EldenRingEnv(gym.Env):
             # print(f"   [MAP STATE] Map is open at step {self.steps}, action={action}, action_name={self.action_names[action] if action < len(self.action_names) else 'unknown'}")
             pass
         
-        # ===== TRACK INTERACT HASH ATTEMPTS (when pressing E on valid target) =====
-        # Capture the prompt hash when we press E on a valid prompt for success rate tracking
+        # ===== 5-LAYER ANTI-FARMING SYSTEM (when pressing E on valid target) =====
+        # Implements layered protections against prompt farming:
+        # Layer 1: Door-like prompts get full reward
+        # Layer 2: Per-hash cooldown (50 steps)
+        # Layer 3: Global cooldown (10 steps)
+        # Layer 4: Normal handling (first non-door reward, records step)
+        # Layer 5: Escalating penalty (fallback after repeated attempts)
+        
         if original_action == 12 and door_state.get('has_open_prompt', False):
-            # We're pressing E on a valid prompt - capture its hash for tracking
+            # We're pressing E on a valid prompt - apply 5-layer logic
             try:
                 current_hash = _hash_prompt_region(state.get('raw_screen'))
             except NameError as e:
-                print(f"🔴 DEBUG: NameError at LINE 806 _hash_prompt_region(state.get('raw_screen')): {e}")
+                print(f"🔴 DEBUG: NameError at _hash_prompt_region: {e}")
                 raise
-            if current_hash:
-                # Initialize hash stats if new
-                if current_hash not in self.prompt_hash_stats:
-                    self.prompt_hash_stats[current_hash] = {'attempts': 0, 'successes': 0}
-                # Increment attempts for this hash
-                self.prompt_hash_stats[current_hash]['attempts'] += 1
-                # Track which hash we just attempted
-                self.last_attempted_prompt_hash = current_hash
+            
+            # ===== DEFENSIVE HASH HANDLING =====
+            # Handle hash = None IMMEDIATELY (don't use None as dict key)
+            # Map None to "__NONE__" sentinel to avoid key issues
+            if current_hash is None:
+                current_hash = "__NONE__"  # Sentinel for unhashable prompts
+            
+            # Update canonical last_prompt_hash (f) - set once, use everywhere
+            self.last_prompt_hash = current_hash
+            self.last_attempted_prompt_hash = current_hash
+            
+            # ===== INITIALIZE & DECAY TRACKING =====
+            # Initialize hash stats if new
+            if current_hash not in self.prompt_hash_stats:
+                self.prompt_hash_stats[current_hash] = {
+                    'attempts': 0,
+                    'door_successes': 0,
+                    'last_attempt_step': -9999
+                }
+            
+            # Per-hash decay: if this hash hasn't been attempted in 200 steps, decay attempt count
+            last_attempt = self.prompt_hash_stats[current_hash].get('last_attempt_step', -9999)
+            if self.steps - last_attempt > self.ATTEMPT_DECAY_INTERVAL:
+                old_attempts = self.prompt_hash_stats[current_hash]['attempts']
+                decayed = int(old_attempts * self.ATTEMPT_DECAY_FACTOR)
+                if decayed < old_attempts:
+                    self.prompt_hash_stats[current_hash]['attempts'] = decayed
+            
+            # ===== GLOBAL DECAY LOOP =====
+            # Periodically decay ALL hashes to prevent permanent lockout
+            if self.steps - self.last_global_decay_step > self.GLOBAL_DECAY_INTERVAL:
+                for hash_key, stats in self.prompt_hash_stats.items():
+                    old_attempts = stats['attempts']
+                    decayed = int(old_attempts * self.ATTEMPT_DECAY_FACTOR)
+                    if decayed < old_attempts:
+                        stats['attempts'] = decayed
+                self.last_global_decay_step = self.steps
+            
+            # ===== ATTEMPT COUNTING =====
+            # CRITICAL: Increment attempts BEFORE priority evaluation (so escalation can trigger)
+            self.prompt_hash_stats[current_hash]['attempts'] += 1
+            self.prompt_hash_stats[current_hash]['last_attempt_step'] = self.steps
+            # NOTE: last_prompt_hash already set above in DEFENSIVE HASH HANDLING section
+            
+            # Determine if this is a door-like prompt
+            is_door_like = door_state.get('has_closable_door', False) and door_state.get('prompt_is_white', False)
+            
+            # Initialize cooldown tracking if needed
+            if current_hash not in self.prompt_last_reward_step:
+                self.prompt_last_reward_step[current_hash] = -9999
+            
+            # ===== PRIORITY EVALUATION (mutually exclusive) =====
+            
+            # LAYER 1: Full reward for door-like prompts (white + closable, or proven success)
+            if is_door_like or self.prompt_hash_stats[current_hash].get('door_successes', 0) > 0:
+                reward += self.DOOR_INTERACT_REWARD
+                self.prompt_last_reward_step[current_hash] = self.steps
+                self.steps_since_last_interact_reward = 0
+                # Reset attempts after door success (hash has been bootstrapped)
+                self.prompt_hash_stats[current_hash]['attempts'] = 0
+                self.telemetry_door_rewards += 1
+            
+            # LAYER 2: Per-hash cooldown (prevents farming same hash across frames)
+            elif self.prompt_last_reward_step.get(current_hash, -9999) + self.PER_HASH_COOLDOWN > self.steps:
+                reward += self.NON_DOOR_INTERACT_REWARD
+                reward -= self.PER_HASH_PENALTY
+                self.telemetry_per_hash_cooldown_hits += 1
+            
+            # LAYER 3: Global cooldown (prevents rapid-fire interact spam)
+            elif self.steps_since_last_interact_reward < self.GLOBAL_INTERACT_COOLDOWN:
+                reward += self.NON_DOOR_INTERACT_REWARD
+                reward -= self.GLOBAL_PENALTY
+                self.telemetry_global_cooldown_hits += 1
+            
+            # LAYER 5: Escalating penalty (fallback for persistent attempts on locked/failed prompts)
+            # NOTE: Skip escalation on "__NONE__" bucket (unhashable prompts) - escalate much slower or skip entirely (b)
+            elif current_hash != "__NONE__" and self.prompt_hash_stats[current_hash].get('attempts', 0) > self.ATTEMPT_THRESHOLD:
+                attempts = self.prompt_hash_stats[current_hash]['attempts']
+                escalation = min(self.ESCALATION_MULTIPLIER * (attempts - self.ATTEMPT_THRESHOLD), self.ESCALATION_CAP)
+                reward += self.NON_DOOR_INTERACT_REWARD
+                reward -= escalation
+                self.telemetry_escalations_applied += 1
+            
+            # LAYER 4: Normal handling (first non-door reward, no cooldowns active)
+            else:
+                reward += self.NON_DOOR_INTERACT_REWARD
+                self.prompt_last_reward_step[current_hash] = self.steps
+                self.steps_since_last_interact_reward = 0
+                self.telemetry_non_door_rewards += 1
         
         # Calculate movement and action rewards using the ORIGINAL action chosen
         # RecurrentPPO doesn't support ActionMasker, so we use reward penalties instead
@@ -1090,6 +1278,28 @@ class EldenRingEnv(gym.Env):
             print(f"   Final episode reward: {self.episode_reward:.2f}")
         
         truncated = self.steps >= self.max_steps
+        
+        # ===== TELEMETRY OUTPUT AT EPISODE END (h) =====
+        # Print compact JSON telemetry when episode terminates or truncates
+        if terminated or truncated:
+            import json
+            telemetry = {
+                'episode_reward': round(self.episode_reward, 2),
+                'steps': self.steps,
+                'terminated': terminated,
+                'truncated': truncated,
+                'chapel_exited': self.chapel_exited,
+                'boss_spawned': self.boss_spawned,
+                'interact_telemetry': {
+                    'door_rewards': self.telemetry_door_rewards,
+                    'non_door_rewards': self.telemetry_non_door_rewards,
+                    'per_hash_cooldown_hits': self.telemetry_per_hash_cooldown_hits,
+                    'global_cooldown_hits': self.telemetry_global_cooldown_hits,
+                    'escalations_applied': self.telemetry_escalations_applied,
+                },
+                'prompt_hashes_tracked': len(self.prompt_hash_stats),
+            }
+            print(f"\n📊 EPISODE TELEMETRY: {json.dumps(telemetry)}")
         
         info = {
             'episode_reward': self.episode_reward,
@@ -1510,6 +1720,10 @@ class EldenRingEnv(gym.Env):
                     self.last_interact_action_step = self.steps
                     self.prompt_visible_consecutive_steps = 0  # Reset dwell counter
                     
+                    # Capture prompt state for partial door signal detection (g)
+                    self._interact_pressed_prompt_white = door_state.get('prompt_is_white', False)
+                    self._last_exit_count_at_interact = exits.get('total', 0)
+                    
                 elif ground_items_visible:
                     # GROUND ITEMS VISIBLE: Loot, items, or similar
                     self.successful_interact_count += 1
@@ -1523,7 +1737,7 @@ class EldenRingEnv(gym.Env):
                     # Check for repetition penalty: if this hash has 0% success, penalize further attempts
                     if self.last_attempted_prompt_hash and self.last_attempted_prompt_hash in self.prompt_hash_stats:
                         hash_stats = self.prompt_hash_stats[self.last_attempted_prompt_hash]
-                        if hash_stats['successes'] == 0 and hash_stats['attempts'] >= 1:
+                        if hash_stats.get('door_successes', 0) == 0 and hash_stats.get('attempts', 0) >= 1:
                             # This hash has never succeeded - strong penalty for trying again
                             reward -= 1.0  # Penalty for beating dead horse (locked door without key, etc.)
                     
@@ -1763,7 +1977,7 @@ class EldenRingEnv(gym.Env):
             report_lines.append("\n" + "=" * 70)
             report_lines.append("PROMPT HASH STATISTICS - Success Rates by Visual Signature")
             report_lines.append("=" * 70)
-            report_lines.append(f"\n{'Hash':<12} {'Attempts':<10} {'Successes':<10} {'Success Rate':<15} {'Notes'}")
+            report_lines.append(f"\n{'Hash':<12} {'Attempts':<10} {'Door Opens':<10} {'Success Rate':<15} {'Notes'}")
             report_lines.append("-" * 70)
             
             # Sort by attempts (most tested first)
@@ -1772,9 +1986,9 @@ class EldenRingEnv(gym.Env):
                                  reverse=True)
             
             for hash_val, stats in sorted_hashes:
-                attempts = stats['attempts']
-                successes = stats['successes']
-                success_rate = (successes / attempts * 100) if attempts > 0 else 0.0
+                attempts = stats.get('attempts', 0)
+                door_successes = stats.get('door_successes', 0)
+                success_rate = (door_successes / attempts * 100) if attempts > 0 else 0.0
                 
                 # Determine status notes
                 if success_rate == 100:
@@ -1788,14 +2002,61 @@ class EldenRingEnv(gym.Env):
                 else:
                     notes = "✗ Mostly failures"
                 
-                report_lines.append(f"{hash_val:<12} {attempts:<10} {successes:<10} {success_rate:>6.1f}%         {notes}")
+                report_lines.append(f"{hash_val:<12} {attempts:<10} {door_successes:<10} {success_rate:>6.1f}%         {notes}")
             
             report_lines.append("-" * 70)
             report_lines.append(f"\nTotal unique prompt signatures: {len(self.prompt_hash_stats)}")
-            total_attempts = sum(s['attempts'] for s in self.prompt_hash_stats.values())
-            total_successes = sum(s['successes'] for s in self.prompt_hash_stats.values())
+            total_attempts = sum(s.get('attempts', 0) for s in self.prompt_hash_stats.values())
+            total_successes = sum(s.get('door_successes', 0) for s in self.prompt_hash_stats.values())
             overall_success_rate = (total_successes / total_attempts * 100) if total_attempts > 0 else 0.0
             report_lines.append(f"Overall prompt success rate: {overall_success_rate:.1f}%")
+        
+        # 5-Layer Anti-Farming Telemetry
+        report_lines.append("\n" + "=" * 70)
+        report_lines.append("5-LAYER ANTI-FARMING TELEMETRY - Reward Distribution Analysis")
+        report_lines.append("=" * 70)
+        total_interact_attempts = (self.telemetry_door_rewards + self.telemetry_non_door_rewards + 
+                                   self.telemetry_per_hash_cooldown_hits + self.telemetry_global_cooldown_hits + 
+                                   self.telemetry_escalations_applied)
+        
+        if total_interact_attempts > 0:
+            door_pct = (self.telemetry_door_rewards / total_interact_attempts * 100)
+            non_door_pct = (self.telemetry_non_door_rewards / total_interact_attempts * 100)
+            ph_cooldown_pct = (self.telemetry_per_hash_cooldown_hits / total_interact_attempts * 100)
+            global_cooldown_pct = (self.telemetry_global_cooldown_hits / total_interact_attempts * 100)
+            escalation_pct = (self.telemetry_escalations_applied / total_interact_attempts * 100)
+            
+            report_lines.append(f"\nTotal Interact Attempts Tracked: {total_interact_attempts:,}")
+            report_lines.append("-" * 70)
+            report_lines.append(f"Layer 1 (Door Rewards):         {self.telemetry_door_rewards:>8,} ({door_pct:>6.2f}%)")
+            report_lines.append(f"Layer 4 (Normal Non-Door):     {self.telemetry_non_door_rewards:>8,} ({non_door_pct:>6.2f}%)")
+            report_lines.append(f"Layer 2 (Per-Hash Cooldown):   {self.telemetry_per_hash_cooldown_hits:>8,} ({ph_cooldown_pct:>6.2f}%)")
+            report_lines.append(f"Layer 3 (Global Cooldown):     {self.telemetry_global_cooldown_hits:>8,} ({global_cooldown_pct:>6.2f}%)")
+            report_lines.append(f"Layer 5 (Escalation Penalty):  {self.telemetry_escalations_applied:>8,} ({escalation_pct:>6.2f}%)")
+            report_lines.append("-" * 70)
+            
+            # Analysis
+            report_lines.append("\nInterpretation:")
+            if door_pct > 50:
+                report_lines.append(f"  ✓ Excellent: {door_pct:.1f}% of attempts are successful doors (bootstrapping working)")
+            elif door_pct > 20:
+                report_lines.append(f"  ⚠️  Moderate: {door_pct:.1f}% door success (detection may need tuning)")
+            else:
+                report_lines.append(f"  ✗ Low: Only {door_pct:.1f}% are door successes (check door detection)")
+            
+            if escalation_pct > 30:
+                report_lines.append(f"  ⚠️  WARNING: {escalation_pct:.1f}% hit escalation penalty (may indicate farming or weak detection)")
+            elif escalation_pct > 10:
+                report_lines.append(f"  ℹ️  Moderate escalations: {escalation_pct:.1f}% (some stuck prompts detected)")
+            else:
+                report_lines.append(f"  ✓ Low escalations: {escalation_pct:.1f}% (good - farming prevented)")
+            
+            if ph_cooldown_pct + global_cooldown_pct > 60:
+                report_lines.append(f"  ✓ High cooldown rate: {ph_cooldown_pct + global_cooldown_pct:.1f}% (prevents spam)")
+            else:
+                report_lines.append(f"  ℹ️  Cooldown rate: {ph_cooldown_pct + global_cooldown_pct:.1f}%")
+        else:
+            report_lines.append("\n⚠️  No interact telemetry recorded")
         
         report_lines.append("=" * 70 + "\n")
         
@@ -1912,6 +2173,13 @@ class EldenRingEnv(gym.Env):
         self.interact_inventory_when_pressed = tuple()  # Reset saved inventory state
         self.last_prompt_hash = None  # Reset prompt hash tracking
         self.prompt_attempt_counts = {}  # Reset per-prompt attempt counts
+        
+        # Reset 5-layer anti-farming telemetry for new episode
+        self.telemetry_door_rewards = 0
+        self.telemetry_non_door_rewards = 0
+        self.telemetry_escalations_applied = 0
+        self.telemetry_per_hash_cooldown_hits = 0
+        self.telemetry_global_cooldown_hits = 0
         
         # NOTE: DO NOT reset map state or subwindow state - preserve across episodes
         # The game doesn't reset between episodes, so if the map/subwindow are open,
@@ -2289,6 +2557,8 @@ class AIAgent:
         Args:
             label: optional label for the checkpoint
         """
+        import json
+        
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         checkpoint_name = f"model_checkpoint_{timestamp}"
         if label:
@@ -2297,9 +2567,19 @@ class AIAgent:
         checkpoint_path = os.path.join(self.checkpoint_dir, checkpoint_name)
         self.model.save(checkpoint_path)
         
+        # Save prompt hash stats (for Layer 3 bootstrapping persistence)
+        base_env = self.env.unwrapped
+        prompt_hash_stats = base_env.prompt_hash_stats if hasattr(base_env, 'prompt_hash_stats') else {}
+        
+        stats_path = checkpoint_path + "_prompt_stats.json"
+        try:
+            with open(stats_path, "w") as f:
+                json.dump(prompt_hash_stats, f, indent=2)
+        except Exception as e:
+            print(f"⚠️  Warning: Could not save prompt_hash_stats: {e}")
+        
         # Save metadata and training statistics
         metadata_path = checkpoint_path + "_metadata.txt"
-        base_env = self.env.unwrapped
         action_counts = base_env.action_counts if hasattr(base_env, 'action_counts') else np.zeros(19)
         action_names = base_env.action_names if hasattr(base_env, 'action_names') else [f"Action {i}" for i in range(19)]
         
@@ -2352,6 +2632,18 @@ class AIAgent:
         checkpoint_path = os.path.join(self.checkpoint_dir, latest)
         
         self.model = RecurrentPPO.load(checkpoint_path, env=self.env)
+        
+        # Load prompt hash stats (restore Layer 3 bootstrapping)
+        import json
+        stats_path = checkpoint_path + "_prompt_stats.json"
+        base_env = self.env.unwrapped
+        if os.path.exists(stats_path) and hasattr(base_env, 'prompt_hash_stats'):
+            try:
+                with open(stats_path, "r") as f:
+                    base_env.prompt_hash_stats = json.load(f)
+                    print(f"✓ Loaded {len(base_env.prompt_hash_stats)} prompt hash statistics")
+            except Exception as e:
+                print(f"⚠️  Warning: Could not load prompt_hash_stats: {e}")
         
         # Load metadata
         metadata_path = checkpoint_path + "_metadata.txt"

@@ -69,14 +69,14 @@ Tracks 10 attributes of game state:
 - Combat status
 
 **Rewards & Penalties:**
-- **State Change**: +0.4 reward whenever any attribute changes (was +0.2)
-- **Stagnation Penalty**: -0.1 per frame after 3 unchanged frames (was 5), capped at -0.5
+- **State Change**: +0.6 reward whenever any attribute changes
+- **Stagnation Penalty**: -0.1 per frame after 3 unchanged frames, capped at -0.5
 - **Purpose**: Encourages exploring new areas, meeting new NPCs, finding new exits
 
-**Behavior Target:**
-- Forward movement into new areas → multiple state changes → +0.4 × N rewards
-- Standing still → no state change → -0.1 escalating penalty
-- Strafing in place → no state change → penalty accumulates
+**Suppression Mechanics:**
+- Blocked for 8 frames after interact action (prevents UI exploits)
+- Blocked for 8 frames after map action (prevents UI state change exploitation)
+- Blocked for 8 frames after camera/mount action (prevents spinning/animation exploits)
 
 #### Visual Pixel Curiosity (Low-Level)
 Computes mean absolute difference between 8×8 downsampled grayscale frames.
@@ -114,9 +114,9 @@ The interact system uses **5 priority layers** to prevent reward exploitation wh
 
 #### Layer 2: Per-Hash Cooldown (Temporal Gate)
 - **Condition**: 50 steps since last attempt on same hash
-- **Reward**: +0.2 - 0.25 = -0.05 net penalty
+- **Reward**: +0.2 - 0.5 = -0.3 net penalty (stronger to prevent spam)
 - **Purpose**: Prevents rapid re-spamming of the same prompt
-- **Decay**: Resets every 200 steps (automatic attempt count halving)
+- **Decay**: Auto-halving every 200 steps (per-hash), global reset every 300 steps
 
 #### Layer 3: Global Interact Cooldown
 - **Condition**: 10 steps since any interact attempt
@@ -128,24 +128,25 @@ The interact system uses **5 priority layers** to prevent reward exploitation wh
 - **Condition**: Non-door prompt, first ever attempt on hash
 - **Reward**: +0.2 (tiny reward, neutral for exploration)
 - **Purpose**: Allows free testing of unknown prompts
-- **Resets cooldown**: `steps_since_last_interact_reward = 0`
+- **Escalation Trigger**: Attempts > 1 (escalates faster, only 1 free test)
 
 #### Layer 5: Escalating Repetition Penalty
-- **Condition**: Hash attempt count > 2 (more than 2 tries without success)
-- **Formula**: +0.2 - min(0.5 × (attempts - 2), 1.5)
+- **Condition**: Hash attempt count > 1 (attempts at 2+ trigger penalty)
+- **Formula**: +0.2 - min(0.5 × (attempts - 1), 1.5)
 - **Penalty Cap**: -1.5 (prevents permanent lockout, always recoverable)
 - **Decay**: Automatic halving every 200 steps, global reset every 300 steps
 - **Hash=None Handling**: Skips escalation for unhashable prompts (maps to "__NONE__")
 
 #### Anti-Farming Mechanics
-- **Attempt Increment Timing**: Incremented BEFORE layer evaluation (line 1098) to prevent skipped counts
-- **Global Cooldown Aging**: Increments every step (line 484) - cannot be bypassed
+- **Attempt Increment Timing**: Incremented BEFORE layer evaluation to prevent skipped counts
+- **Global Cooldown Aging**: Increments every step - cannot be bypassed
 - **Partial Door Signals**: Detects animation progress even without full state change:
   - Prompt white → grey transition (+0.5 bonus)
   - Player position forward > 0.5 units (+0.3 bonus)
   - Exits increased in world (+0.2 bonus)
   - ANY signal triggers `door_successes += 1` and attempt reset
-- **Escalation Recovery**: Global decay loop runs every 300 steps (line 486-493), automatically halving attempt counts across ALL hashes
+- **Escalation Recovery**: Global decay loop runs every 300 steps, automatically halving attempt counts across ALL hashes
+- **Curiosity Suppression**: State-signature reward blocked for 8 frames post-interact, post-map, and post-camera/mount actions
 
 #### Telemetry Tracking
 5 counters track layer distribution per episode:
@@ -156,9 +157,9 @@ The interact system uses **5 priority layers** to prevent reward exploitation wh
 - `telemetry_escalations_applied`: Layer 5 escalations
 - JSON output at episode end for parameter tuning
 
-### Movement (Now Primary Focus + Direction Stability)
-- **Forward Movement**: +1.5 (was +1.0, increased to compete with lower interact rewards)
-- **Movement Momentum**: +0.5 every 10 consecutive frames in same direction (NEW - encourages sustained exploration)
+### Movement (Primary Focus)
+- **Forward Movement**: +2.0 (strong incentive for primary exploration direction)
+- **Movement Momentum**: +0.5 every 10 consecutive frames in same direction (encourages sustained exploration)
 - **Momentum Reset**: Resets to 0 whenever interact action is taken
 - **Backward Movement**: -0.5 (opposite of goal)
 - **Sideways Movement**: -0.10 (not primary direction)
@@ -185,12 +186,13 @@ Prevents AI from switching directions rapidly to farm micro-rewards without real
 ### Ground Item Interaction
 - **Ground Items Pickup**: +0.7 (bonus for looting utility items)
 
-### Map (Heavily Suppressed)
+### Map (Heavily Suppressed with Multiple Layers)
 - **Opening Map**: -15.0 (severe penalty, immediate application suppresses other rewards)
 - **Any Action While Map Open**: -0.5/step (continuous penalty encourages closing)
 - **Map Reopen Cooldown**: 900 steps (30 seconds) after closing to prevent oscillation
+- **State-Signature Curiosity Block**: +0.6 reward suppressed for 8 frames post-map action
+- **Visual Curiosity Block**: Already suppressed when map UI is open
 - **Subwindow Validation**: State resync ensures penalties only apply when map actually open
-- **Visual Curiosity Suppression**: Curiosity rewards suppressed when map/subwindow open, preventing AI from farming visual novelty rewards from UI transitions
 
 ### Combat Actions (Prime Directives)
 - **Attack Actions (Normal/Heavy)**: -0.2 (combat avoided during exploration)
@@ -208,7 +210,8 @@ Prevents AI from switching directions rapidly to farm micro-rewards without real
 ### Camera & Navigation
 - **Camera Panning (Solo)**: -0.15 (small penalty for wasting time)
 - **Camera + Forward Movement**: +0.05 (bonus for intelligent steering)
-- **Time Penalty**: -0.003 per step (encourages speed, normalized from -0.005)
+- **Camera/Mount Curiosity Suppression**: Visual and state-signature rewards blocked for 8 frames post-action
+- **Time Penalty**: -0.01 per step (forces faster movement, stronger than previous -0.003)
 
 ### Major Events
 - **Chapel Exit Bonus**: +1.0 to +5.0 (based on speed)
@@ -378,31 +381,32 @@ python analyze_training.py
 - ✅ **Dual-layer curiosity**: High-level state changes + low-level pixel changes
 - ✅ **All resets implemented**: Episode start, area transitions, state changes
 
-**Phase 5: 5-Layer Anti-Farming System (CURRENT)**
-- ✅ **Layer 1**: Door success bootstrapping (+4.0 full reward once door_successes > 0)
-- ✅ **Layer 2**: Per-hash cooldown (50 steps, +0.2 - 0.25 = -0.05 penalty)
-- ✅ **Layer 3**: Global interact cooldown (10 steps, +0.2 - 0.1 = +0.1 penalty)
-- ✅ **Layer 4**: First-time non-door (+0.2 tiny reward for new hashes)
-- ✅ **Layer 5**: Escalating repetition penalty (capped at -1.5, auto-recovery via decay)
-- ✅ **Attempt increment timing**: Before all layer branches (line 1098), happens exactly once
-- ✅ **Global cooldown aging**: Every step (line 484), prevents bypassing
-- ✅ **Partial door signal detection**: Greying (+0.5), position (+0.3), exits (+0.2)
-- ✅ **Hash=None handling**: Maps to "__NONE__" sentinel, skips escalation (lines 1063, 1134)
-- ✅ **Per-hash decay**: Auto-halving every 200 steps (ATTEMPT_DECAY_INTERVAL)
-- ✅ **Global decay**: Periodic reset every 300 steps (GLOBAL_DECAY_INTERVAL)
-- ✅ **Telemetry counters**: 5 metrics track layer distribution per episode
-- ✅ **Episode-end reporting**: JSON telemetry printed at terminal (line 1303)
-- ✅ **All observations verified**: 7/7 timing, cooldown, decay, and telemetry behaviors confirmed
+**Phase 5: Enhanced Curiosity Suppression & Reward Amplification (CURRENT - December 2025)**
+- ✅ **Per-hash cooldown strengthened**: -0.25 → -0.5 penalty (makes re-spamming more costly)
+- ✅ **Attempt threshold lowered**: 2 → 1 (escalation triggers at 2nd attempt instead of 3rd, fewer free tests)
+- ✅ **State-signature curiosity amplified**: +0.4 → +0.6 (makes exploration 50% more attractive)
+- ✅ **Time penalty increased**: -0.003 → -0.01 per step (makes standing still 3x more costly)
+- ✅ **Forward movement increased**: +1.5 → +2.0 per step (makes movement more attractive than interact attempts)
+- ✅ **Interact curiosity suppression**: Added 8-frame suppression window for state-signature rewards post-interact
+- ✅ **Map curiosity suppression**: Added 8-frame suppression window blocking +0.6 reward post-map action
+- ✅ **Camera/mount curiosity suppression**: Added 8-frame suppression window blocking visual + state-signature rewards
+- ✅ **Map action re-enabled**: Action space back to 19 (action 18 available) after testing
+- ✅ **Multi-layer curiosity suppression**: Interact, map, and camera/mount actions all block hidden reward exploitation
 
 **Current Tuning Parameters:**
-- **Layer 1 Reward**: +4.0 (door success bootstrapping)
-- **Layer 2 Cooldown**: 50 steps (per-hash), penalty -0.25
-- **Layer 3 Cooldown**: 10 steps (global), penalty -0.1
+- **State-Signature Curiosity**: +0.6 per state change
+- **Time Penalty**: -0.01 per step
+- **Forward Movement**: +2.0 per step
+- **Per-Hash Cooldown Penalty**: -0.5
+- **Attempt Threshold**: 1 (escalation at 2nd attempt)
+- **Layer 1 Reward**: +4.0 (door success)
+- **Layer 2 Cooldown**: 50 steps, -0.5 penalty
+- **Layer 3 Cooldown**: 10 steps, -0.1 penalty
 - **Layer 4 Reward**: +0.2 (first-time non-door)
-- **Layer 5 Penalty**: min(0.5 × (attempts - 2), 1.5) capped at -1.5
-- **Per-hash decay**: 200 steps (ATTEMPT_DECAY_INTERVAL), 0.5 factor (halves attempts)
-- **Global decay**: 300 steps (GLOBAL_DECAY_INTERVAL), applies to all hashes
-- **Partial door rewards**: +0.5 (greying) + 0.3 (position) + 0.2 (exits)
+- **Layer 5 Cap**: -1.5 (escalation penalty cap)
+- **Per-hash decay**: 200 steps (ATTEMPT_DECAY_INTERVAL), 0.5 factor
+- **Global decay**: 300 steps (GLOBAL_DECAY_INTERVAL)
+- **Curiosity suppression duration**: 8 frames (interact, map, camera/mount)
 
 **Expected Results After Implementation:**
 - Interact attempts: ~10% (constrained by cooldowns, escalation penalties)
@@ -430,70 +434,47 @@ python analyze_training.py
 ## Tuning Parameters (Current Configuration)
 
 ### 5-Layer Anti-Farming System
-To adjust interact behavior, modify values in [ai_agent.py](ai_agent.py) `__init__()` method (lines 340-465):
+To adjust interact behavior, modify values in [ai_agent.py](ai_agent.py) `__init__()` method:
 
-**Layer Configuration:**
-- **LAYER_1_DOOR_REWARD (4.0)**: Full reward for bootstrapped doors (line 358)
-- **NON_DOOR_INTERACT_REWARD (0.2)**: Tiny reward for first attempts (line 359)
-- **PER_HASH_COOLDOWN (50)**: Steps before per-hash penalty expires (line 367)
-- **GLOBAL_INTERACT_COOLDOWN (10)**: Steps before global cooldown penalty expires (line 368)
-- **ATTEMPT_THRESHOLD (2)**: Attempts before escalation triggers (line 370)
-- **ESCALATION_PENALTY_FACTOR (0.5)**: Multiplier for escalating penalty (line 371)
-- **ESCALATION_CAP (1.5)**: Maximum escalation penalty (line 372)
-- **ATTEMPT_DECAY_INTERVAL (200)**: Steps between per-hash decay (line 374)
-- **ATTEMPT_DECAY_FACTOR (0.5)**: Multiplier for decaying attempts (line 375)
-- **GLOBAL_DECAY_INTERVAL (300)**: Steps between global decay (line 377)
+**Layer Constants:**
+- **LAYER_1_DOOR_REWARD (4.0)**: Full reward for bootstrapped doors
+- **NON_DOOR_INTERACT_REWARD (0.2)**: Tiny reward for first attempts
+- **PER_HASH_COOLDOWN (50)**: Steps before per-hash penalty expires
+- **GLOBAL_INTERACT_COOLDOWN (10)**: Steps before global cooldown expires
+- **PER_HASH_PENALTY (0.5)**: Penalty when per-hash cooldown active
+- **GLOBAL_PENALTY (0.1)**: Penalty when global cooldown active
+- **ATTEMPT_THRESHOLD (1)**: Attempts before escalation triggers (escalates at 2nd attempt)
+- **ESCALATION_MULTIPLIER (0.5)**: Multiplier for escalating penalty
+- **ESCALATION_CAP (1.5)**: Maximum escalation penalty
+- **ATTEMPT_DECAY_INTERVAL (200)**: Steps between per-hash decay
+- **ATTEMPT_DECAY_FACTOR (0.5)**: Multiplier for decaying attempts
+- **GLOBAL_DECAY_INTERVAL (300)**: Steps between global decay
 
 **Layer Reward/Penalty Formulas:**
 ```python
 Layer 1: +4.0 (if is_door_like OR door_successes > 0)
-Layer 2: +0.2 - 0.25 (if per_hash_cooldown_active)
+Layer 2: +0.2 - 0.5 (if per_hash_cooldown_active)
 Layer 3: +0.2 - 0.1 (if global_cooldown_active)
 Layer 4: +0.2 (if first_time_non_door)
-Layer 5: +0.2 - min(0.5 × (attempts - 2), 1.5) (else)
+Layer 5: +0.2 - min(0.5 × (attempts - 1), 1.5) (else)
 ```
-
-**Decay Mechanics:**
-- Per-hash: Every 200 steps, `attempts ÷= 2` for each hash (line 486-489)
-- Global: Every 300 steps, ALL hashes get attempt halving (line 490-493)
-- Manual reset: `self.prompt_hash_stats[hash]['attempts'] = 0` after partial door signals (line 854)
 
 **Recovery Path:**
 - Worst case penalty: +0.2 - 1.5 = -1.3 per step
-- Forward movement reward: +1.5 per step
-- Net: Forward movement (+1.5) dominates worst-case escalation (-1.3), AI can always escape
-- Global decay: Every 300 steps, even locked hashes recover automatic attempt resets
+- Forward movement reward: +2.0 per step (amplified)
+- Net: Forward movement dominates escalation, AI can always escape
+- Global decay: Every 300 steps, all hashes automatically reset attempts
 
-### Curiosity Reward System
-To adjust exploration behavior, modify values in [ai_agent.py](ai_agent.py) step() method:
+### Curiosity System (Dual-Layer with Suppression)
+**State-Signature Curiosity**:
+- **State change reward (+0.6)**: Bonus when any of 10 attributes change
+- **Stagnation penalty (-0.1)**: Per frame after 3 unchanged frames
+- **Suppression**: Blocked for 8 frames post-interact, post-map, post-camera/mount
 
-**State-Signature Curiosity** (lines 507-514, 561-563):
-- **State change reward (+0.4)**: Bonus when any of 10 state attributes changes (exits, doors, health, stamina, prompts, items, location, combat)
-- **Stagnation penalty (-0.1)**: Applied per frame after 3 unchanged frames
-- **Penalty cap (-0.5)**: Maximum accumulated stagnation penalty
-- **Stagnation threshold (3 frames)**: Frames before penalty starts (was 5, now more aggressive)
-
-**Visual Pixel Curiosity** (lines 572-600):
-- **Large visual change (+0.1)**: Reward threshold at diff > 5 (indicates forward movement, exploration)
-- **Low visual change penalty (-0.05)**: Applied when diff < 2 for 3+ consecutive frames (strafing, standing still)
-- **Frame downsample (8×8)**: Lightweight computation, ignores fine details
-- **Penalty trigger (3 frames)**: Consecutive frames of low visual diff before penalty applies
-
-**Why dual layers:**
-- State-signature alone: Can't detect wall-pushing, strafing in place
-- Visual diff alone: Can't detect exploration without movement (turning camera)
-- Combined: Catches both high-level and low-level farming behaviors
-
-### Direction Control System
-To adjust direction stability, modify values in [ai_agent.py](ai_agent.py) step() method (lines 600-650):
-- **Direction change penalty (-0.4)**: Applied when changing direction before 5-frame threshold
-- **Direction continuity bonus (+0.3)**: Applied every 10 consecutive frames in same direction
-- **Direction flip cooldown (5 steps)**: Minimum frames before same direction can be retried
-- **Cooldown penalty (-0.2)**: Applied if flip attempted during active cooldown
-- **Oscillation threshold**: Detects [3,4,3,4] or [4,3,4,3] patterns (left-right alternation)
-- **Oscillation penalty (-0.2)**: Applied on detection
-- **Lateral movement suppression (-0.05)**: Applied when left/right sustained 3+ frames with low visual change
-- **Momentum reset**: Resets `consecutive_frames_in_direction = 0` when interact action (12) taken
+**Visual Pixel Curiosity**:
+- **Large visual change (+0.1)**: Reward threshold at diff > 5
+- **Low visual change penalty (-0.05)**: Applied when diff < 2 for 3+ frames
+- **Suppression**: Blocked when map UI open or post-camera/mount action
 
 ### Interact Reward System
 To adjust interact behavior, modify values in [ai_agent.py](ai_agent.py) step() method (lines 590-625, 1360-1400):

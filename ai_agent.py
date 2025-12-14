@@ -452,14 +452,29 @@ class EldenRingEnv(gym.Env):
         self.NON_DOOR_INTERACT_REWARD = 0.2  # Tiny reward for non-door prompts
         self.PER_HASH_COOLDOWN = 50  # Steps before same hash can be rewarded again
         self.GLOBAL_INTERACT_COOLDOWN = 10  # Steps before any interact can be rewarded
-        self.PER_HASH_PENALTY = 0.25  # Penalty when per-hash cooldown active
+        self.PER_HASH_PENALTY = 0.5  # Penalty when per-hash cooldown active (INCREASED from 0.25 to 0.5)
         self.GLOBAL_PENALTY = 0.1  # Penalty when global cooldown active
-        self.ATTEMPT_THRESHOLD = 2  # Escalation triggers after this many attempts
+        self.ATTEMPT_THRESHOLD = 1  # Escalation triggers after this many attempts (LOWERED from 2 to 1)
         self.ESCALATION_MULTIPLIER = 0.5  # Base escalation penalty scaling
         self.ESCALATION_CAP = 1.5  # Max escalation penalty (prevents deadlock: 0.2 - 1.5 = -1.3 worst case)
         self.ATTEMPT_DECAY_INTERVAL = 200  # Steps between attempt count decay
         self.ATTEMPT_DECAY_FACTOR = 0.5  # Multiply attempts by this factor after interval
         self.GLOBAL_DECAY_INTERVAL = 300  # Global decay loop: apply decay to ALL hashes every 300 steps
+        
+        # Curiosity suppression for interact sequences (prevent visual reward exploitation)
+        self.interact_action_taken = False  # Track if interact action just occurred
+        self.frames_since_interact = 0  # Counter for suppressing visual curiosity post-interact
+        self.INTERACT_CURIOSITY_SUPPRESS_FRAMES = 8  # Frames to suppress visual curiosity after interact
+        
+        # Curiosity suppression for map sequences (prevent map UI state change rewards)
+        self.map_action_taken = False  # Track if map action just occurred
+        self.frames_since_map = 0  # Counter for suppressing state-signature curiosity post-map
+        self.MAP_CURIOSITY_SUPPRESS_FRAMES = 8  # Frames to suppress state-signature curiosity after map
+        
+        # Curiosity suppression for camera/mount sequences (prevent spinning/mount visual diff exploitation)
+        self.camera_or_mount_action_taken = False  # Track if camera or mount action just occurred
+        self.frames_since_camera_or_mount = 0  # Counter for suppressing visual curiosity post-camera/mount
+        self.CAMERA_MOUNT_CURIOSITY_SUPPRESS_FRAMES = 8  # Frames to suppress visual curiosity after camera/mount
         
         # Telemetry for tuning (reset each episode)
         self.telemetry_door_rewards = 0  # Count of full door rewards granted
@@ -479,6 +494,28 @@ class EldenRingEnv(gym.Env):
         Returns:
             observation, reward, terminated, truncated, info
         """
+        # ===== CURIOSITY SUPPRESSION TRACKING =====
+        # Track frames since last interact action to suppress visual curiosity exploitation
+        if self.interact_action_taken:
+            self.frames_since_interact += 1
+            if self.frames_since_interact >= self.INTERACT_CURIOSITY_SUPPRESS_FRAMES:
+                self.interact_action_taken = False
+                self.frames_since_interact = 0
+        
+        # Track frames since last map action to suppress state-signature curiosity exploitation
+        if self.map_action_taken:
+            self.frames_since_map += 1
+            if self.frames_since_map >= self.MAP_CURIOSITY_SUPPRESS_FRAMES:
+                self.map_action_taken = False
+                self.frames_since_map = 0
+        
+        # Track frames since last camera/mount action to suppress visual curiosity exploitation
+        if self.camera_or_mount_action_taken:
+            self.frames_since_camera_or_mount += 1
+            if self.frames_since_camera_or_mount >= self.CAMERA_MOUNT_CURIOSITY_SUPPRESS_FRAMES:
+                self.camera_or_mount_action_taken = False
+                self.frames_since_camera_or_mount = 0
+        
         # ===== GLOBAL COOLDOWN MANAGEMENT (d) =====
         # Increment global cooldown counter EVERY step (ages the global interact cooldown)
         self.steps_since_last_interact_reward += 1
@@ -610,7 +647,11 @@ class EldenRingEnv(gym.Env):
                 self.stuck_counter += 1
         else:
             # State signature changed = exploration reward (curiosity-driven RL)
-            reward += 0.4  # Reward for discovering new state
+            # SUPPRESSED if interact action was just taken (prevent visual UI exploitation)
+            # SUPPRESSED if map action was just taken (prevent map UI state change rewards)
+            # SUPPRESSED if camera/mount action was just taken (prevent spinning/mount visual diff exploitation)
+            if not self.interact_action_taken and not self.map_action_taken and not self.camera_or_mount_action_taken:
+                reward += 0.6  # Reward for discovering new state (INCREASED from 0.4 to 0.6)
             self.consecutive_unchanged_frames = 0  # Reset stagnation counter
             
             self.stuck_counter = max(0, self.stuck_counter - 1)  # Gradually decrease
@@ -644,8 +685,8 @@ class EldenRingEnv(gym.Env):
                 # CHANNEL A: Movement-based visual change
                 # Reward only when moving (actions 1-4) AND visual diff is high
                 if original_action in {1, 2, 3, 4}:  # Movement actions
-                    # Suppress curiosity rewards from map UI transitions
-                    if self.map_open or self.map_subwindow_open:
+                    # Suppress curiosity rewards from map UI transitions and camera/mount actions
+                    if self.map_open or self.map_subwindow_open or self.camera_or_mount_action_taken:
                         adjusted_visual_diff = 0
                     else:
                         adjusted_visual_diff = visual_diff
@@ -669,8 +710,8 @@ class EldenRingEnv(gym.Env):
                 elif original_action in {14, 15, 16, 17}:  # Camera actions: left, right, up, down
                     self.steps_since_last_camera_reward += 1
                     
-                    # Suppress curiosity rewards from map UI transitions
-                    if self.map_open or self.map_subwindow_open:
+                    # Suppress curiosity rewards from map UI transitions and camera/mount actions
+                    if self.map_open or self.map_subwindow_open or self.camera_or_mount_action_taken:
                         adjusted_visual_diff = 0
                     else:
                         adjusted_visual_diff = visual_diff
@@ -1353,10 +1394,16 @@ class EldenRingEnv(gym.Env):
         elif action == 12:
             # Interact with NPCs/objects/doors
             self.game_interface.interact()
+            # Flag that interact action was taken (suppress visual curiosity for next 8 frames)
+            self.interact_action_taken = True
+            self.frames_since_interact = 0
             # Melina dialogue will be detected in step() function when conditions are met
         elif action == 13:
             # Summon mount
             self.game_interface.summon_mount()
+            # Flag that camera/mount action was taken (suppress visual curiosity for next 8 frames)
+            self.camera_or_mount_action_taken = True
+            self.frames_since_camera_or_mount = 0
         elif action == 14:
             # Pan camera left
             try:
@@ -1365,6 +1412,9 @@ class EldenRingEnv(gym.Env):
                 mouse.move(-30, 0)
             except Exception:
                 pass  # Mouse control not available, skip camera action
+            # Flag that camera action was taken (suppress visual curiosity for next 8 frames)
+            self.camera_or_mount_action_taken = True
+            self.frames_since_camera_or_mount = 0
         elif action == 15:
             # Pan camera right
             try:
@@ -1373,6 +1423,9 @@ class EldenRingEnv(gym.Env):
                 mouse.move(30, 0)
             except Exception:
                 pass  # Mouse control not available, skip camera action
+            # Flag that camera action was taken (suppress visual curiosity for next 8 frames)
+            self.camera_or_mount_action_taken = True
+            self.frames_since_camera_or_mount = 0
         elif action == 16:
             # Pan camera up
             try:
@@ -1381,6 +1434,9 @@ class EldenRingEnv(gym.Env):
                 mouse.move(0, -30)
             except Exception:
                 pass  # Mouse control not available, skip camera action
+            # Flag that camera action was taken (suppress visual curiosity for next 8 frames)
+            self.camera_or_mount_action_taken = True
+            self.frames_since_camera_or_mount = 0
         elif action == 17:
             # Pan camera down
             try:
@@ -1389,9 +1445,15 @@ class EldenRingEnv(gym.Env):
                 mouse.move(0, 30)
             except Exception:
                 pass  # Mouse control not available, skip camera action
+            # Flag that camera action was taken (suppress visual curiosity for next 8 frames)
+            self.camera_or_mount_action_taken = True
+            self.frames_since_camera_or_mount = 0
         elif action == 18:
             # Open map
             self.game_interface.open_map()
+            # Flag that map action was taken (suppress state-signature curiosity for next 8 frames)
+            self.map_action_taken = True
+            self.frames_since_map = 0
     
     def _calculate_reward(self, action, health=-1, stamina=-1, invalid=False, exits=None, quickslots=None, door_state=None, ground_items_visible=False, in_combat=False):
         """
@@ -1536,7 +1598,7 @@ class EldenRingEnv(gym.Env):
                     reward -= 0.10  # Penalty for sideways (not primary direction)
         
         # Time penalty - all steps cost tiny amount to encourage speed
-        reward -= 0.003
+        reward -= 0.01  # INCREASED from 0.003 to force faster movement
         
         # ========== MOVEMENT IS PRIMARY BUT NOT FREE ==========
         if action in self.MOVEMENT_ACTIONS:  # Movement (forward/back/left/right)
@@ -1552,8 +1614,8 @@ class EldenRingEnv(gym.Env):
                     else:  # Just started getting stuck
                         reward -= 0.75  # Light penalty to encourage trying different direction
                 else:
-                    reward += 1.5  # Forward movement bonus
-                                    # Total for forward: +1.5 bonus alone
+                    reward += 2.0  # Forward movement bonus (INCREASED from 1.5 to 2.0)
+                                    # Total for forward: +2.0 bonus alone
                     
                     # MOMENTUM BONUS: Reward continuing forward if that was last action (+0.5 per 10 frames)
                     if self.last_movement_action == 1:
@@ -2173,6 +2235,14 @@ class EldenRingEnv(gym.Env):
         self.interact_inventory_when_pressed = tuple()  # Reset saved inventory state
         self.last_prompt_hash = None  # Reset prompt hash tracking
         self.prompt_attempt_counts = {}  # Reset per-prompt attempt counts
+        
+        # Reset curiosity suppression for new episode
+        self.interact_action_taken = False
+        self.frames_since_interact = 0
+        self.map_action_taken = False
+        self.frames_since_map = 0
+        self.camera_or_mount_action_taken = False
+        self.frames_since_camera_or_mount = 0
         
         # Reset 5-layer anti-farming telemetry for new episode
         self.telemetry_door_rewards = 0
